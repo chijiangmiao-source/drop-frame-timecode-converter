@@ -175,6 +175,105 @@ func TestSpanFramesEndBeforeStart(t *testing.T) {
 	}
 }
 
+func TestOffsetTimecode(t *testing.T) {
+	cases := []struct {
+		name    string
+		rate    Rate
+		tc      string
+		offset  int64
+		wantTC  string
+		wantDay int
+	}{
+		{"30 zero offset returns same label", Rate2997, "00:10:00;00", 0, "00:10:00;00", 0},
+		{"30 zero offset at start of day", Rate2997, "00:00:00;00", 0, "00:00:00;00", 0},
+		{"30 zero offset at end of day", Rate2997, "23:59:59;29", 0, "23:59:59;29", 0},
+		{"30 in-point moved back across ten-minute boundary", Rate2997, "00:10:00;00", -1, "00:09:59;29", 0},
+		{"30 ten minutes back", Rate2997, "00:10:00;00", -17982, "00:00:00;00", 0},
+		{"30 forward across ten-minute boundary", Rate2997, "00:09:59;29", 2, "00:10:00;01", 0},
+		{"30 last frame steps to next day first frame", Rate2997, "23:59:59;29", 1, "00:00:00;00", 1},
+		{"30 first frame steps back to previous day last frame", Rate2997, "00:00:00;00", -1, "23:59:59;29", -1},
+		{"30 next-day reach at the far boundary (last+N)", Rate2997, "23:59:59;29", 2589408, "23:59:59;29", 1},
+		{"30 previous-day reach at the far boundary (0-N)", Rate2997, "00:00:00;00", -2589408, "00:00:00;00", -1},
+		{"60 zero offset returns same label", Rate5994, "01:00:00;04", 0, "01:00:00;04", 0},
+		{"60 zero offset at start of day", Rate5994, "00:00:00;00", 0, "00:00:00;00", 0},
+		{"60 in-point moved back across ten-minute boundary", Rate5994, "00:10:00;00", -1, "00:09:59;59", 0},
+		{"60 ten minutes back", Rate5994, "00:10:00;00", -35964, "00:00:00;00", 0},
+		{"60 forward across ten-minute boundary", Rate5994, "00:09:59;59", 2, "00:10:00;01", 0},
+		{"60 last frame steps to next day first frame", Rate5994, "23:59:59;59", 1, "00:00:00;00", 1},
+		{"60 first frame steps back to previous day last frame", Rate5994, "00:00:00;00", -1, "23:59:59;59", -1},
+		{"60 next-day reach at the far boundary", Rate5994, "23:59:59;59", 5178816, "23:59:59;59", 1},
+		{"60 previous-day reach at the far boundary", Rate5994, "00:00:00;00", -5178816, "00:00:00;00", -1},
+	}
+	for _, c := range cases {
+		got, err := OffsetTimecode(c.rate, c.tc, c.offset)
+		if err != nil {
+			t.Errorf("%s: OffsetTimecode error: %v", c.name, err)
+			continue
+		}
+		if got.Timecode != c.wantTC || got.DayOffset != c.wantDay {
+			t.Errorf("%s: OffsetTimecode(%s, %d) = %+v, want {%s day %d}",
+				c.name, c.tc, c.offset, got, c.wantTC, c.wantDay)
+		}
+	}
+}
+
+func TestOffsetTimecodeReusesLabelValidation(t *testing.T) {
+	cases := []struct {
+		name      string
+		tc        string
+		wantCode  Code
+		wantField string
+	}{
+		{"bad format", "00:10:00:00", CodeInvalidTimecodeFormat, "timecode"},
+		{"dropped label", "00:01:00;01", CodeDroppedFrameLabel, "timecode"},
+		{"hour out of range", "24:00:00;00", CodeInvalidTimecodeFormat, "timecode"},
+	}
+	for _, c := range cases {
+		_, err := OffsetTimecode(Rate2997, c.tc, 10)
+		te, ok := err.(*Error)
+		if !ok || te.Code != c.wantCode || te.Field != c.wantField {
+			t.Errorf("%s: want %s on timecode, got %v", c.name, c.wantCode, err)
+		}
+	}
+}
+
+func TestOffsetOutOfRange(t *testing.T) {
+	for _, rate := range []Rate{Rate2997, Rate5994} {
+		framesPerDay := MaxFrameIndex(rate) + 1
+		cases := []struct {
+			name   string
+			tc     string
+			offset int64
+		}{
+			{"forward past next day", "23:59:59;" + lastFrameDigits(rate), framesPerDay + 1},
+			{"backward past previous day", "00:00:00;00", -framesPerDay - 1},
+			{"huge forward offset", "00:10:00;00", framesPerDay*2 + 1},
+			{"huge backward offset", "00:10:00;00", -(framesPerDay*2 + 1)},
+			{"int64 max offset", "00:10:00;00", 1<<63 - 1},
+			{"int64 min offset", "00:10:00;00", -1 << 63},
+		}
+		for _, c := range cases {
+			got, err := OffsetTimecode(rate, c.tc, c.offset)
+			te, ok := err.(*Error)
+			if !ok || te.Code != CodeOffsetOutOfRange || te.Field != "frame_offset" {
+				t.Errorf("%s rate=%s: want OFFSET_OUT_OF_RANGE on frame_offset, got %+v err=%v",
+					c.name, rate.ID(), got, err)
+			}
+			if got.Timecode != "" || got.DayOffset != 0 {
+				t.Errorf("%s rate=%s: out-of-range result must not carry a target, got %+v",
+					c.name, rate.ID(), got)
+			}
+		}
+	}
+}
+
+func lastFrameDigits(rate Rate) string {
+	if rate == Rate2997 {
+		return "29"
+	}
+	return "59"
+}
+
 func TestSpanFramesFieldErrors(t *testing.T) {
 	cases := []struct {
 		name      string

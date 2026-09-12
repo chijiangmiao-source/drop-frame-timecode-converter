@@ -45,6 +45,7 @@ func main() {
 	checkMinuteContinuity()
 	checkErrorEnvelope()
 	checkTimecodeSpan()
+	checkTimecodeOffset()
 	checkRoundTrip()
 
 	if failures > 0 {
@@ -98,6 +99,28 @@ func convert(payload map[string]any) (int, map[string]any) {
 	return resp.StatusCode, decoded
 }
 
+// convertRaw performs one conversion call with a raw JSON body and returns
+// status plus decoded body.
+func convertRaw(raw string) (int, map[string]any) {
+	resp, err := client.Post(baseURL+"/api/v1/convert", "application/json", bytes.NewReader([]byte(raw)))
+	if err != nil {
+		fail("POST /api/v1/convert: %v", err)
+		return 0, nil
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fail("read response: %v", err)
+		return resp.StatusCode, nil
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		fail("response is not JSON: %v (body: %s)", err, data)
+		return resp.StatusCode, nil
+	}
+	return resp.StatusCode, decoded
+}
+
 func fail(format string, args ...any) {
 	failures++
 	fmt.Printf("FAIL: %s\n", fmt.Sprintf(format, args...))
@@ -142,8 +165,9 @@ func expectError(name string, payload map[string]any, wantCode, wantField string
 	_, leakedFrame := body["frame_index"]
 	_, leakedTC := body["timecode"]
 	_, leakedSpan := body["elapsed_frames"]
+	_, leakedDay := body["day_offset"]
 	if status != http.StatusUnprocessableEntity || code != wantCode || field != wantField ||
-		leakedFrame || leakedTC || leakedSpan {
+		leakedFrame || leakedTC || leakedSpan || leakedDay {
 		fail("%s: want 422 code=%s field=%s without partial result, got status=%d body=%v",
 			name, wantCode, wantField, status, body)
 		return
@@ -351,6 +375,78 @@ func checkTimecodeSpan() {
 		map[string]any{"direction": "timecode_span", "rate": rate30.id,
 			"start_timecode": "00:10:00;00", "end_timecode": "00:10:00:00"},
 		"INVALID_TIMECODE_FORMAT", "end_timecode")
+}
+
+// expectOffset asserts a timecode_offset conversion returns the expected
+// target label and day_offset (-1 previous day, 0 same day, +1 next day).
+func expectOffset(name string, rate rateSpec, tc string, offset int64, wantTC string, wantDay int) {
+	status, body := convert(map[string]any{
+		"direction": "timecode_offset", "rate": rate.id,
+		"timecode": tc, "frame_offset": offset,
+	})
+	gotTC, okTC := body["timecode"].(string)
+	gotDay, okDay := body["day_offset"].(float64)
+	if status != http.StatusOK || !okTC || !okDay || gotTC != wantTC || int(gotDay) != wantDay {
+		fail("%s: want timecode=%s day_offset=%d, got status=%d body=%v",
+			name, wantTC, wantDay, status, body)
+		return
+	}
+	pass("%s: %s day_offset=%d", name, gotTC, wantDay)
+}
+
+// checkTimecodeOffset exercises the timecode_offset direction at both
+// rates: zero offsets, an editing point moved back across a ten-minute
+// boundary, the last frame stepping into the first frame of the next day,
+// a step back into the previous day, and rejection past an adjacent day.
+func checkTimecodeOffset() {
+	fmt.Println("--- timecode offset ---")
+	for _, rate := range rates {
+		_, lastBody := convert(map[string]any{
+			"direction": "frame_to_timecode", "rate": rate.id, "frame_index": rate.max,
+		})
+		lastLabel, _ := lastBody["timecode"].(string)
+		firstFF := "00"
+		lastFF := fmt.Sprintf("%02d", rate.fps-1)
+
+		// Zero offset returns the original label and day_offset 0.
+		expectOffset(fmt.Sprintf("rate=%s zero offset mid-day", rate.id), rate,
+			"00:10:00;00", 0, "00:10:00;00", 0)
+		expectOffset(fmt.Sprintf("rate=%s zero offset at day edge", rate.id), rate,
+			lastLabel, 0, lastLabel, 0)
+
+		// Editing point moved one frame earlier across a ten-minute boundary.
+		expectOffset(fmt.Sprintf("rate=%s ten-minute boundary moved back one frame", rate.id), rate,
+			"00:10:00;00", -1, "00:09:59;"+lastFF, 0)
+
+		// Last frame of the day shifted one frame later lands on the first
+		// frame of the next day; the inverse step lands on the previous day.
+		expectOffset(fmt.Sprintf("rate=%s last frame crosses to next day first frame", rate.id), rate,
+			lastLabel, 1, "00:00:00;"+firstFF, 1)
+		expectOffset(fmt.Sprintf("rate=%s first frame crosses to previous day last frame", rate.id), rate,
+			"00:00:00;00", -1, lastLabel, -1)
+
+		// Offsets past the adjacent natural day are rejected with no target.
+		expectError(fmt.Sprintf("rate=%s offset past next day", rate.id),
+			map[string]any{"direction": "timecode_offset", "rate": rate.id,
+				"timecode": lastLabel, "frame_offset": rate.max + 2},
+			"OFFSET_OUT_OF_RANGE", "frame_offset")
+		expectError(fmt.Sprintf("rate=%s offset past previous day", rate.id),
+			map[string]any{"direction": "timecode_offset", "rate": rate.id,
+				"timecode": "00:00:00;00", "frame_offset": -(rate.max + 2)},
+			"OFFSET_OUT_OF_RANGE", "frame_offset")
+	}
+
+	// Non-integer offsets and trailing JSON are rejected by strict parsing.
+	if st, b := convertRaw(`{"direction":"timecode_offset","rate":"30000/1001","timecode":"00:10:00;00","frame_offset":1.5}`); st != http.StatusBadRequest {
+		fail("non-integer frame_offset: want 400, got status=%d body=%v", st, b)
+	} else {
+		pass("non-integer frame_offset rejected with 400 MALFORMED_JSON")
+	}
+	if st, b := convertRaw(`{"direction":"timecode_offset","rate":"30000/1001","timecode":"00:10:00;00","frame_offset":-1}{"x":1}`); st != http.StatusBadRequest {
+		fail("trailing JSON: want 400, got status=%d body=%v", st, b)
+	} else {
+		pass("trailing JSON rejected with 400 MALFORMED_JSON")
+	}
 }
 
 func checkRoundTrip() {

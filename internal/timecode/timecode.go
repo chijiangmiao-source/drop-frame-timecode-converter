@@ -27,6 +27,7 @@ const (
 	CodeDroppedFrameLabel     Code = "DROPPED_FRAME_LABEL"
 	CodeFrameIndexOutOfRange  Code = "FRAME_INDEX_OUT_OF_RANGE"
 	CodeEndBeforeStart        Code = "END_BEFORE_START"
+	CodeOffsetOutOfRange      Code = "OFFSET_OUT_OF_RANGE"
 )
 
 // Error describes a single invalid input field.
@@ -241,4 +242,72 @@ func SpanFrames(rate Rate, start, end string, nextDay bool) (int64, error) {
 	}
 	framesPerDay := MaxFrameIndex(rate) + 1
 	return framesPerDay - startIndex + endIndex, nil
+}
+
+// OffsetResult is the outcome of shifting a timecode label by a signed
+// frame count. Timecode is the label of the target frame within its day,
+// and DayOffset locates that day relative to the input: -1 for the
+// previous day, 0 for the same day, +1 for the next day.
+type OffsetResult struct {
+	Timecode  string
+	DayOffset int
+}
+
+// OffsetTimecode validates a timecode label and shifts its frame index by
+// frameOffset frames, reusing the same rate parsing, label validation and
+// index<->label conversions as the other directions. The shifted index is
+// normalized against the total frame count of the day, so the result can
+// only land on the previous day, the same day or the next day; a zero
+// offset returns the original label with DayOffset 0. An offset that would
+// cross past an adjacent natural day is rejected with OFFSET_OUT_OF_RANGE
+// on field "frame_offset".
+func OffsetTimecode(rate Rate, tc string, frameOffset int64) (OffsetResult, error) {
+	base, err := FrameIndexFromTimecode(rate, tc)
+	if err != nil {
+		return OffsetResult{}, err
+	}
+
+	framesPerDay := MaxFrameIndex(rate) + 1
+
+	// Reachable offsets without addition overflow: same day is
+	// [-base, framesPerDay-1-base]; one day further in either direction is
+	// the only legal extension.
+	var dayOffset int64
+	switch {
+	case frameOffset < -base:
+		if frameOffset < -framesPerDay-base {
+			return OffsetResult{}, &Error{
+				Code:  CodeOffsetOutOfRange,
+				Field: "frame_offset",
+				Message: fmt.Sprintf("frame_offset %d from %q moves more than one day backwards at rate %s; only the previous day, the same day or the next day are reachable",
+					frameOffset, tc, rate.id),
+			}
+		}
+		dayOffset = -1
+	case frameOffset > framesPerDay-1-base:
+		if frameOffset > 2*framesPerDay-1-base {
+			return OffsetResult{}, &Error{
+				Code:  CodeOffsetOutOfRange,
+				Field: "frame_offset",
+				Message: fmt.Sprintf("frame_offset %d from %q moves more than one day forwards at rate %s; only the previous day, the same day or the next day are reachable",
+					frameOffset, tc, rate.id),
+			}
+		}
+		dayOffset = 1
+	default:
+		dayOffset = 0
+	}
+
+	shifted := base + frameOffset
+	if dayOffset == -1 {
+		shifted += framesPerDay
+	} else if dayOffset == 1 {
+		shifted -= framesPerDay
+	}
+
+	target, err := TimecodeFromFrameIndex(rate, shifted)
+	if err != nil {
+		return OffsetResult{}, err
+	}
+	return OffsetResult{Timecode: target, DayOffset: int(dayOffset)}, nil
 }

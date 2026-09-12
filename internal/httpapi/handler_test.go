@@ -259,6 +259,151 @@ func TestTimecodeSpan(t *testing.T) {
 	}
 }
 
+func TestTimecodeOffset(t *testing.T) {
+	cases := []struct {
+		name    string
+		rate    string
+		tc      string
+		offset  int64
+		wantTC  string
+		wantDay int
+	}{
+		// Editing-point moves backwards across a ten-minute boundary.
+		{"30 zero offset returns same label", "30000/1001", "00:10:00;00", 0, "00:10:00;00", 0},
+		{"30 ten-minute boundary moved back one frame", "30000/1001", "00:10:00;00", -1, "00:09:59;29", 0},
+		{"30 ten minutes back", "30000/1001", "00:10:00;00", -17982, "00:00:00;00", 0},
+		{"30 last frame crosses to next day first frame", "30000/1001", "23:59:59;29", 1, "00:00:00;00", 1},
+		{"30 first frame crosses to previous day last frame", "30000/1001", "00:00:00;00", -1, "23:59:59;29", -1},
+		{"60 zero offset returns same label", "60000/1001", "00:10:00;00", 0, "00:10:00;00", 0},
+		{"60 ten-minute boundary moved back one frame", "60000/1001", "00:10:00;00", -1, "00:09:59;59", 0},
+		{"60 ten minutes back", "60000/1001", "00:10:00;00", -35964, "00:00:00;00", 0},
+		{"60 last frame crosses to next day first frame", "60000/1001", "23:59:59;59", 1, "00:00:00;00", 1},
+		{"60 first frame crosses to previous day last frame", "60000/1001", "00:00:00;00", -1, "23:59:59;59", -1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			status, body := doConvert(t, map[string]any{
+				"direction": "timecode_offset", "rate": c.rate,
+				"timecode": c.tc, "frame_offset": c.offset,
+			})
+			require.Equal(t, http.StatusOK, status, "body: %v", body)
+			assert.Equal(t, c.wantTC, body["timecode"])
+			assert.Equal(t, float64(c.wantDay), body["day_offset"])
+			assert.NotContains(t, body, "frame_index")
+			assert.NotContains(t, body, "elapsed_frames")
+			assert.NotContains(t, body, "error")
+		})
+	}
+}
+
+func TestTimecodeOffsetOutOfRange(t *testing.T) {
+	cases := []struct {
+		name   string
+		rate   string
+		tc     string
+		offset int64
+	}{
+		{"30 forward past next day", "30000/1001", "23:59:59;29", 2589409},
+		{"30 backward past previous day", "30000/1001", "00:00:00;00", -2589409},
+		{"60 forward past next day", "60000/1001", "23:59:59;59", 5178817},
+		{"60 backward past previous day", "60000/1001", "00:00:00;00", -5178817},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			status, body := doConvert(t, map[string]any{
+				"direction": "timecode_offset", "rate": c.rate,
+				"timecode": c.tc, "frame_offset": c.offset,
+			})
+			assertError(t, status, body, "OFFSET_OUT_OF_RANGE", "frame_offset")
+			// day_offset is a result field too and must not leak on failure.
+			assert.NotContains(t, body, "day_offset")
+		})
+	}
+}
+
+func TestTimecodeOffsetFieldErrors(t *testing.T) {
+	cases := []struct {
+		name      string
+		body      map[string]any
+		wantCode  string
+		wantField string
+	}{
+		{"missing timecode", map[string]any{
+			"direction": "timecode_offset", "rate": "30000/1001", "frame_offset": 1},
+			"MISSING_FIELD", "timecode"},
+		{"missing frame_offset", map[string]any{
+			"direction": "timecode_offset", "rate": "30000/1001", "timecode": "00:10:00;00"},
+			"MISSING_FIELD", "frame_offset"},
+		{"bad timecode format", map[string]any{
+			"direction": "timecode_offset", "rate": "30000/1001",
+			"timecode": "00:10:00:00", "frame_offset": 1},
+			"INVALID_TIMECODE_FORMAT", "timecode"},
+		{"dropped timecode label", map[string]any{
+			"direction": "timecode_offset", "rate": "30000/1001",
+			"timecode": "00:01:00;01", "frame_offset": 1},
+			"DROPPED_FRAME_LABEL", "timecode"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			status, body := doConvert(t, c.body)
+			assertError(t, status, body, c.wantCode, c.wantField)
+		})
+	}
+}
+
+func TestTimecodeOffsetNonIntegerRejected(t *testing.T) {
+	// JSON decoding into *int64 rejects fractional and non-numeric values.
+	for _, raw := range []string{`1.5`, `"1"`, `true`} {
+		body := `{"direction":"timecode_offset","rate":"30000/1001",` +
+			`"timecode":"00:10:00;00","frame_offset":` + raw + `}`
+		status, resp := doConvert(t, body)
+		require.Equal(t, http.StatusBadRequest, status, "raw=%s body=%v", raw, resp)
+		errObj, ok := resp["error"].(map[string]any)
+		require.True(t, ok, "error envelope missing: %v", resp)
+		assert.Equal(t, "MALFORMED_JSON", errObj["code"])
+		assert.NotContains(t, resp, "timecode")
+		assert.NotContains(t, resp, "day_offset")
+	}
+}
+
+func TestTimecodeOffsetAmbiguousFieldsRejected(t *testing.T) {
+	base := `"direction":"timecode_offset","rate":"30000/1001","timecode":"00:10:00;00","frame_offset":-1`
+	cases := []struct {
+		name      string
+		body      string
+		wantField string
+	}{
+		{"duplicate timecode with different values", `{` + base + `,"timecode":"00:10:00;01"}`, "timecode"},
+		{"duplicate frame_offset with different values", `{` + base + `,"frame_offset":-2}`, "frame_offset"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			status, body := doConvert(t, c.body)
+			assertError(t, status, body, "AMBIGUOUS_FIELD", c.wantField)
+		})
+	}
+}
+
+func TestTimecodeOffsetDuplicateFieldWithSameValueAccepted(t *testing.T) {
+	body := `{"direction":"timecode_offset","rate":"30000/1001","timecode":"00:10:00;00",` +
+		`"frame_offset":-1,"frame_offset":-1}`
+	status, resp := doConvert(t, body)
+	require.Equal(t, http.StatusOK, status, "body: %v", resp)
+	assert.Equal(t, "00:09:59;29", resp["timecode"])
+	assert.Equal(t, float64(0), resp["day_offset"])
+}
+
+func TestTimecodeOffsetTrailingJSONRejected(t *testing.T) {
+	body := `{"direction":"timecode_offset","rate":"30000/1001","timecode":"00:10:00;00",` +
+		`"frame_offset":-1}{"direction":"timecode_to_frame"}`
+	status, resp := doConvert(t, body)
+	require.Equal(t, http.StatusBadRequest, status)
+	errObj, ok := resp["error"].(map[string]any)
+	require.True(t, ok, "error envelope missing: %v", resp)
+	assert.Equal(t, "MALFORMED_JSON", errObj["code"])
+	assert.NotContains(t, resp, "timecode")
+}
+
 func TestTimecodeSpanEndBeforeStartRejected(t *testing.T) {
 	for _, rate := range []string{"30000/1001", "60000/1001"} {
 		status, body := doConvert(t, map[string]any{

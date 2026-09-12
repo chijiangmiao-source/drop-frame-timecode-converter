@@ -7,6 +7,7 @@
 - 正向：时间码 → 从当天 `00:00:00;00` 起、首帧为 0 的整数帧序号
 - 反向：帧序号 → 当日唯一合法时间码标签
 - 跨度：两个时间码 → 实际帧间隔（不含起点帧），可选跨零点续算，避免客户端各自处理日期翻转
+- 偏移：时间码 + 带符号整数帧数 → 目标时间码与日期位移（前一日 -1、当日 0、次日 1），结果只落在相邻自然日，剪辑点前移或跨午夜后移均由服务端归一化
 - 全部换算基于公式实时计算，正反两个方向互为逆运算，可逆定位
 
 ## 丢帧规则
@@ -28,7 +29,7 @@ API_PORT=9000 docker compose up --build
 docker compose up --build --abort-on-container-exit verify
 ```
 
-`verify` 服务等待 API 健康后执行验收：边界向量、丢帧标签非法性、1440 次分钟连续衔接（含十分钟边界）、时间码跨度（同日、跨午夜、零跨度与未授权跨日拒绝）、错误响应格式、抽样回环可逆性，全部通过则以退出码 0 结束，否则非 0。
+`verify` 服务等待 API 健康后执行验收：边界向量、丢帧标签非法性、1440 次分钟连续衔接（含十分钟边界）、时间码跨度（同日、跨午夜、零跨度与未授权跨日拒绝）、时间码偏移（两种帧率的零偏移、十分钟边界前移、末帧跨次日首帧与越界拒绝）、错误响应格式、抽样回环可逆性，全部通过则以退出码 0 结束，否则非 0。
 
 本地开发（需要 Go 1.25）：
 
@@ -39,7 +40,7 @@ go run ./cmd/api     # 监听 :8080，可用 LISTEN_ADDR 覆盖
 
 ## 请求示例
 
-`POST /api/v1/convert`，请求体包含 `direction`、`rate`，以及按方向选择的 `timecode`、`frame_index` 或 `start_timecode` + `end_timecode`（可选 `next_day`）。
+`POST /api/v1/convert`，请求体包含 `direction`、`rate`，以及按方向选择的 `timecode`、`frame_index`、`start_timecode` + `end_timecode`（可选 `next_day`）或 `timecode` + 整数 `frame_offset`。
 
 正向换算（时间码 → 帧序号）：
 
@@ -89,6 +90,34 @@ curl -s -X POST http://localhost:8080/api/v1/convert \
 {"elapsed_frames": 1}
 ```
 
+偏移换算（时间码 + 带符号整数帧数 → 目标时间码与日期位移）。调整片段入点时，直接提交需要移动的帧数即可，跨日回绕由服务端处理：`day_offset` 为 `-1`、`0`、`1` 分别表示结果落在前一日、当日与次日，`frame_offset=0` 时原样返回标签与 `0`。
+
+剪辑点前移一帧（30 fps 下从十分钟边界退回上一分钟末帧，仍在当日）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/convert \
+  -H 'Content-Type: application/json' \
+  -d '{"direction":"timecode_offset","rate":"30000/1001","timecode":"00:10:00;00","frame_offset":-1}'
+```
+
+```json
+{"timecode": "00:09:59;29", "day_offset": 0}
+```
+
+跨午夜后移（当日最后一帧后移一帧即为次日首帧，`day_offset=1`；同理首帧前移一帧得前一日末帧与 `-1`）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/convert \
+  -H 'Content-Type: application/json' \
+  -d '{"direction":"timecode_offset","rate":"30000/1001","timecode":"23:59:59;29","frame_offset":1}'
+```
+
+```json
+{"timecode": "00:00:00;00", "day_offset": 1}
+```
+
+结果仅可落在相邻自然日：偏移按当日总帧数（30 fps 为 2589408 帧、60 fps 为 5178816 帧）归一化，例如从当日末帧后移一整天恰好到次日末帧仍合法，再多一帧即越过次日，返回 422 `OFFSET_OUT_OF_RANGE`（指向 `frame_offset`）且不携带目标值。
+
 请求被跳过的丢帧标签：
 
 ```bash
@@ -105,10 +134,11 @@ curl -s -X POST http://localhost:8080/api/v1/convert \
 
 | 字段 | 约束 |
 | --- | --- |
-| `direction` | `timecode_to_frame`、`frame_to_timecode` 或 `timecode_span` |
+| `direction` | `timecode_to_frame`、`frame_to_timecode`、`timecode_span` 或 `timecode_offset` |
 | `rate` | `30000/1001` 或 `60000/1001` |
 | `timecode` | 严格 `HH:MM:SS;FF`；HH 00-23，MM/SS 00-59；FF 上限 29（30 fps）或 59（60 fps）；不得为被跳过的标签 |
 | `frame_index` | 整数，`0` 至当日最后合法帧（含） |
+| `frame_offset` | 仅 `timecode_offset`；带符号整数帧数。结果归一化到前一日、当日或次日；越过相邻自然日返回 422 `OFFSET_OUT_OF_RANGE` |
 | `start_timecode` / `end_timecode` | 仅 `timecode_span`；约束同 `timecode` |
 | `next_day` | 仅 `timecode_span`；可选布尔，缺省 `false`。终点早于起点时须为 `true`，按跨零点计算，跨度不超过一天 |
 
@@ -124,10 +154,11 @@ curl -s -X POST http://localhost:8080/api/v1/convert \
 | --- | --- | --- |
 | `INVALID_DIRECTION` | `direction` | 方向取值不支持 |
 | `INVALID_RATE` | `rate` | 帧率取值不支持 |
-| `MISSING_FIELD` | `timecode` / `frame_index` / `start_timecode` / `end_timecode` | 当前方向必需的字段缺失 |
+| `MISSING_FIELD` | `timecode` / `frame_index` / `frame_offset` / `start_timecode` / `end_timecode` | 当前方向必需的字段缺失 |
 | `INVALID_TIMECODE_FORMAT` | `timecode` / `start_timecode` / `end_timecode` | 格式或分量越界 |
 | `DROPPED_FRAME_LABEL` | `timecode` / `start_timecode` / `end_timecode` | 被丢帧规则跳过的标签 |
 | `FRAME_INDEX_OUT_OF_RANGE` | `frame_index` | 负数或越过当日最后合法帧 |
+| `OFFSET_OUT_OF_RANGE` | `frame_offset` | 偏移后越过前一日或次日（结果只能落在相邻自然日） |
 | `END_BEFORE_START` | `end_timecode` | 终点早于起点且未提交 `next_day=true` |
 | `AMBIGUOUS_FIELD` | 冲突字段 | 同一字段重复出现且取值不同，请求含义不唯一 |
 | `MALFORMED_JSON` | — | 请求体不是单一、合法 JSON 对象（HTTP 400） |

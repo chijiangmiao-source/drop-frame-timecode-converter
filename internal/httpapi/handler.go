@@ -15,6 +15,7 @@ const (
 	DirectionTimecodeToFrame = "timecode_to_frame"
 	DirectionFrameToTimecode = "frame_to_timecode"
 	DirectionTimecodeSpan    = "timecode_span"
+	DirectionTimecodeOffset  = "timecode_offset"
 )
 
 type convertRequest struct {
@@ -22,6 +23,7 @@ type convertRequest struct {
 	Rate          string  `json:"rate"`
 	Timecode      *string `json:"timecode"`
 	FrameIndex    *int64  `json:"frame_index"`
+	FrameOffset   *int64  `json:"frame_offset"`
 	StartTimecode *string `json:"start_timecode"`
 	EndTimecode   *string `json:"end_timecode"`
 	NextDay       bool    `json:"next_day"`
@@ -76,9 +78,9 @@ func handleConvert(c *gin.Context) {
 	}
 
 	if req.Direction != DirectionTimecodeToFrame && req.Direction != DirectionFrameToTimecode &&
-		req.Direction != DirectionTimecodeSpan {
+		req.Direction != DirectionTimecodeSpan && req.Direction != DirectionTimecodeOffset {
 		respondError(c, http.StatusUnprocessableEntity, timecode.CodeInvalidDirection, "direction",
-			"direction must be \"timecode_to_frame\", \"frame_to_timecode\" or \"timecode_span\"")
+			"direction must be \"timecode_to_frame\", \"frame_to_timecode\", \"timecode_span\" or \"timecode_offset\"")
 		return
 	}
 
@@ -133,5 +135,23 @@ func handleConvert(c *gin.Context) {
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"elapsed_frames": elapsed})
+
+	case DirectionTimecodeOffset:
+		if req.Timecode == nil {
+			respondError(c, http.StatusUnprocessableEntity, timecode.CodeMissingField, "timecode",
+				"timecode is required when direction is \"timecode_offset\"")
+			return
+		}
+		if req.FrameOffset == nil {
+			respondError(c, http.StatusUnprocessableEntity, timecode.CodeMissingField, "frame_offset",
+				"frame_offset is required when direction is \"timecode_offset\"")
+			return
+		}
+		result, err := timecode.OffsetTimecode(rate, *req.Timecode, *req.FrameOffset)
+		if err != nil {
+			respondConversionError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"timecode": result.Timecode, "day_offset": result.DayOffset})
 	}
 }
