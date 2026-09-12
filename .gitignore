@@ -1,0 +1,11 @@
+# Build artifacts
+/api
+/verify
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+
+# Local environment overrides
+.env
