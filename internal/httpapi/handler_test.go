@@ -307,6 +307,57 @@ func TestTimecodeSpanFieldErrors(t *testing.T) {
 	}
 }
 
+func TestTimecodeSpanAmbiguousFieldsRejected(t *testing.T) {
+	base := `"direction":"timecode_span","rate":"30000/1001","start_timecode":"23:59:59;29","end_timecode":"00:00:00;00","next_day":true`
+	cases := []struct {
+		name      string
+		body      string
+		wantField string
+	}{
+		{
+			name:      "duplicate start with different values",
+			body:      `{` + base + `,"start_timecode":"23:59:59;28"}`,
+			wantField: "start_timecode",
+		},
+		{
+			name:      "duplicate end with different values",
+			body:      `{` + base + `,"end_timecode":"00:00:00;01"}`,
+			wantField: "end_timecode",
+		},
+		{
+			name:      "conflicting next_day authorization",
+			body:      `{` + base + `,"next_day":false}`,
+			wantField: "next_day",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			status, body := doConvert(t, c.body)
+			assertError(t, status, body, "AMBIGUOUS_FIELD", c.wantField)
+		})
+	}
+}
+
+func TestDuplicateFieldWithSameValueAccepted(t *testing.T) {
+	body := `{"direction":"timecode_span","rate":"30000/1001","start_timecode":"00:10:00;00",` +
+		`"start_timecode":"00:10:00;00","end_timecode":"00:10:00;01"}`
+	status, resp := doConvert(t, body)
+	require.Equal(t, http.StatusOK, status, "body: %v", resp)
+	assert.Equal(t, float64(1), resp["elapsed_frames"])
+}
+
+func TestMultipleJSONObjectsRejected(t *testing.T) {
+	body := `{"direction":"timecode_span","rate":"30000/1001","start_timecode":"00:10:00;00",` +
+		`"end_timecode":"00:10:00;01"}{"direction":"timecode_to_frame","rate":"30000/1001",` +
+		`"timecode":"00:10:00;00"}`
+	status, resp := doConvert(t, body)
+	require.Equal(t, http.StatusBadRequest, status)
+	errObj, ok := resp["error"].(map[string]any)
+	require.True(t, ok, "error envelope missing: %v", resp)
+	assert.Equal(t, "MALFORMED_JSON", errObj["code"])
+	assert.NotContains(t, resp, "elapsed_frames")
+}
+
 func TestMalformedJSON(t *testing.T) {
 	status, body := doConvert(t, "{not json")
 	require.Equal(t, http.StatusBadRequest, status)

@@ -22,6 +22,7 @@ const (
 	CodeInvalidRate           Code = "INVALID_RATE"
 	CodeInvalidDirection      Code = "INVALID_DIRECTION"
 	CodeMissingField          Code = "MISSING_FIELD"
+	CodeAmbiguousField        Code = "AMBIGUOUS_FIELD"
 	CodeInvalidTimecodeFormat Code = "INVALID_TIMECODE_FORMAT"
 	CodeDroppedFrameLabel     Code = "DROPPED_FRAME_LABEL"
 	CodeFrameIndexOutOfRange  Code = "FRAME_INDEX_OUT_OF_RANGE"

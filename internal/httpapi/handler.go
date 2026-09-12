@@ -2,6 +2,7 @@
 package httpapi
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -62,9 +63,15 @@ func NewRouter() *gin.Engine {
 
 func handleConvert(c *gin.Context) {
 	var req convertRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictJSON(c.Request.Body, &req); err != nil {
+		var ambiguous ambiguousFieldError
+		if errors.As(err, &ambiguous) {
+			respondError(c, http.StatusUnprocessableEntity, timecode.CodeAmbiguousField, ambiguous.Field(),
+				"field appears multiple times with different values and its meaning is ambiguous")
+			return
+		}
 		respondError(c, http.StatusBadRequest, "MALFORMED_JSON", "",
-			"request body must be a JSON object with fields direction, rate and the inputs required by the chosen direction")
+			"request body must be a single JSON object with fields direction, rate and the inputs required by the chosen direction")
 		return
 	}
 

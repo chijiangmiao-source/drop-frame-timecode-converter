@@ -129,7 +129,8 @@ curl -s -X POST http://localhost:8080/api/v1/convert \
 | `DROPPED_FRAME_LABEL` | `timecode` / `start_timecode` / `end_timecode` | 被丢帧规则跳过的标签 |
 | `FRAME_INDEX_OUT_OF_RANGE` | `frame_index` | 负数或越过当日最后合法帧 |
 | `END_BEFORE_START` | `end_timecode` | 终点早于起点且未提交 `next_day=true` |
-| `MALFORMED_JSON` | — | 请求体不是合法 JSON（HTTP 400） |
+| `AMBIGUOUS_FIELD` | 冲突字段 | 同一字段重复出现且取值不同，请求含义不唯一 |
+| `MALFORMED_JSON` | — | 请求体不是单一、合法 JSON 对象（HTTP 400） |
 
 ## 目录结构
 
