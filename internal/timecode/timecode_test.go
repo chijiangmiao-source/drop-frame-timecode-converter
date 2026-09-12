@@ -134,6 +134,69 @@ func TestMaxFrameIndexValues(t *testing.T) {
 	}
 }
 
+func TestSpanFrames(t *testing.T) {
+	cases := []struct {
+		name    string
+		rate    Rate
+		start   string
+		end     string
+		nextDay bool
+		want    int64
+	}{
+		{"30 same frame is zero", Rate2997, "00:10:00;00", "00:10:00;00", false, 0},
+		{"30 same day across ten-minute boundary", Rate2997, "00:09:59;29", "00:10:00;01", false, 2},
+		{"30 same day plain difference", Rate2997, "00:01:00;02", "01:00:00;02", false, 106094},
+		{"60 same frame is zero", Rate5994, "00:10:00;00", "00:10:00;00", false, 0},
+		{"60 same day across ten-minute boundary", Rate5994, "00:09:59;59", "00:10:00;03", false, 4},
+		{"30 midnight rollover last frame to first", Rate2997, "23:59:59;29", "00:00:00;00", true, 1},
+		{"30 midnight rollover into next morning", Rate2997, "23:59:00;02", "00:01:00;02", true, 3598},
+		{"60 midnight rollover last frame to second frame", Rate5994, "23:59:59;59", "00:00:00;01", true, 2},
+		{"60 midnight rollover into next morning", Rate5994, "23:59:00;04", "00:01:00;04", true, 7196},
+	}
+	for _, c := range cases {
+		got, err := SpanFrames(c.rate, c.start, c.end, c.nextDay)
+		if err != nil {
+			t.Errorf("%s: SpanFrames error: %v", c.name, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("%s: SpanFrames = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+func TestSpanFramesEndBeforeStart(t *testing.T) {
+	for _, rate := range []Rate{Rate2997, Rate5994} {
+		_, err := SpanFrames(rate, "00:10:00;01", "00:10:00;00", false)
+		te, ok := err.(*Error)
+		if !ok || te.Code != CodeEndBeforeStart || te.Field != "end_timecode" {
+			t.Errorf("rate=%s: want END_BEFORE_START on end_timecode, got %v", rate.ID(), err)
+		}
+	}
+}
+
+func TestSpanFramesFieldErrors(t *testing.T) {
+	cases := []struct {
+		name      string
+		start     string
+		end       string
+		wantCode  Code
+		wantField string
+	}{
+		{"bad start format", "0:00:00;00", "00:10:00;00", CodeInvalidTimecodeFormat, "start_timecode"},
+		{"bad end format", "00:10:00;00", "00:10:00:00", CodeInvalidTimecodeFormat, "end_timecode"},
+		{"dropped start label", "00:01:00;00", "00:10:00;00", CodeDroppedFrameLabel, "start_timecode"},
+		{"dropped end label", "00:10:00;00", "00:11:00;01", CodeDroppedFrameLabel, "end_timecode"},
+	}
+	for _, c := range cases {
+		_, err := SpanFrames(Rate2997, c.start, c.end, false)
+		te, ok := err.(*Error)
+		if !ok || te.Code != c.wantCode || te.Field != c.wantField {
+			t.Errorf("%s: want %s on %s, got %v", c.name, c.wantCode, c.wantField, err)
+		}
+	}
+}
+
 // TestRoundTripExhaustive proves reversibility over every legal frame index
 // of the day for both rates, and that every produced label is legal.
 func TestRoundTripExhaustive(t *testing.T) {

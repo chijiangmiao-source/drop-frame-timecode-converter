@@ -25,6 +25,7 @@ const (
 	CodeInvalidTimecodeFormat Code = "INVALID_TIMECODE_FORMAT"
 	CodeDroppedFrameLabel     Code = "DROPPED_FRAME_LABEL"
 	CodeFrameIndexOutOfRange  Code = "FRAME_INDEX_OUT_OF_RANGE"
+	CodeEndBeforeStart        Code = "END_BEFORE_START"
 )
 
 // Error describes a single invalid input field.
@@ -190,4 +191,53 @@ func TimecodeFromFrameIndex(rate Rate, index int64) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("%02d:%02d:%02d;%02d", h, m, s, f), nil
+}
+
+// frameIndexForField validates a timecode label like FrameIndexFromTimecode
+// but reports errors against the given request field name.
+func frameIndexForField(rate Rate, field, tc string) (int64, error) {
+	index, err := FrameIndexFromTimecode(rate, tc)
+	if err != nil {
+		if te, ok := err.(*Error); ok {
+			return 0, &Error{Code: te.Code, Field: field, Message: te.Message}
+		}
+		return 0, err
+	}
+	return index, nil
+}
+
+// SpanFrames returns the number of real frames elapsed from the start
+// timecode to the end timecode, excluding the start frame itself. Both
+// labels are fully validated (format, ranges, drop-frame legality) and any
+// failure is reported against "start_timecode" or "end_timecode".
+//
+// When the end index is not smaller than the start index the span is a
+// plain difference within the same day. When the end label falls before
+// the start label, the span crosses midnight and is only legal with
+// nextDay=true: it is computed over the day rollover using the total frame
+// count of the day, so the result always stays within one day. Otherwise
+// the request is rejected with END_BEFORE_START on "end_timecode".
+func SpanFrames(rate Rate, start, end string, nextDay bool) (int64, error) {
+	startIndex, err := frameIndexForField(rate, "start_timecode", start)
+	if err != nil {
+		return 0, err
+	}
+	endIndex, err := frameIndexForField(rate, "end_timecode", end)
+	if err != nil {
+		return 0, err
+	}
+
+	if endIndex >= startIndex {
+		return endIndex - startIndex, nil
+	}
+	if !nextDay {
+		return 0, &Error{
+			Code:  CodeEndBeforeStart,
+			Field: "end_timecode",
+			Message: fmt.Sprintf("end_timecode %q falls before start_timecode %q; resubmit with next_day=true to span midnight",
+				end, start),
+		}
+	}
+	framesPerDay := MaxFrameIndex(rate) + 1
+	return framesPerDay - startIndex + endIndex, nil
 }

@@ -13,13 +13,17 @@ import (
 const (
 	DirectionTimecodeToFrame = "timecode_to_frame"
 	DirectionFrameToTimecode = "frame_to_timecode"
+	DirectionTimecodeSpan    = "timecode_span"
 )
 
 type convertRequest struct {
-	Direction  string  `json:"direction"`
-	Rate       string  `json:"rate"`
-	Timecode   *string `json:"timecode"`
-	FrameIndex *int64  `json:"frame_index"`
+	Direction     string  `json:"direction"`
+	Rate          string  `json:"rate"`
+	Timecode      *string `json:"timecode"`
+	FrameIndex    *int64  `json:"frame_index"`
+	StartTimecode *string `json:"start_timecode"`
+	EndTimecode   *string `json:"end_timecode"`
+	NextDay       bool    `json:"next_day"`
 }
 
 type errorBody struct {
@@ -60,13 +64,14 @@ func handleConvert(c *gin.Context) {
 	var req convertRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, "MALFORMED_JSON", "",
-			"request body must be a JSON object with fields direction, rate and timecode or frame_index")
+			"request body must be a JSON object with fields direction, rate and the inputs required by the chosen direction")
 		return
 	}
 
-	if req.Direction != DirectionTimecodeToFrame && req.Direction != DirectionFrameToTimecode {
+	if req.Direction != DirectionTimecodeToFrame && req.Direction != DirectionFrameToTimecode &&
+		req.Direction != DirectionTimecodeSpan {
 		respondError(c, http.StatusUnprocessableEntity, timecode.CodeInvalidDirection, "direction",
-			"direction must be \"timecode_to_frame\" or \"frame_to_timecode\"")
+			"direction must be \"timecode_to_frame\", \"frame_to_timecode\" or \"timecode_span\"")
 		return
 	}
 
@@ -103,5 +108,23 @@ func handleConvert(c *gin.Context) {
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"timecode": tc})
+
+	case DirectionTimecodeSpan:
+		if req.StartTimecode == nil {
+			respondError(c, http.StatusUnprocessableEntity, timecode.CodeMissingField, "start_timecode",
+				"start_timecode is required when direction is \"timecode_span\"")
+			return
+		}
+		if req.EndTimecode == nil {
+			respondError(c, http.StatusUnprocessableEntity, timecode.CodeMissingField, "end_timecode",
+				"end_timecode is required when direction is \"timecode_span\"")
+			return
+		}
+		elapsed, err := timecode.SpanFrames(rate, *req.StartTimecode, *req.EndTimecode, req.NextDay)
+		if err != nil {
+			respondConversionError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"elapsed_frames": elapsed})
 	}
 }

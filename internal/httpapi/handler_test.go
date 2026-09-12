@@ -222,6 +222,91 @@ func TestValidationErrors(t *testing.T) {
 	}
 }
 
+func TestTimecodeSpan(t *testing.T) {
+	cases := []struct {
+		name  string
+		rate  string
+		start string
+		end   string
+		next  bool
+		want  int64
+	}{
+		{"30 same-day ten-minute boundary", "30000/1001", "00:09:59;29", "00:10:00;01", false, 2},
+		{"60 same-day ten-minute boundary", "60000/1001", "00:09:59;59", "00:10:00;03", false, 4},
+		{"30 same frame returns zero", "30000/1001", "00:10:00;00", "00:10:00;00", false, 0},
+		{"60 same frame returns zero", "60000/1001", "01:00:00;04", "01:00:00;04", false, 0},
+		{"30 across midnight", "30000/1001", "23:59:59;29", "00:00:00;00", true, 1},
+		{"30 across midnight into morning", "30000/1001", "23:59:00;02", "00:01:00;02", true, 3598},
+		{"60 across midnight", "60000/1001", "23:59:59;59", "00:00:00;01", true, 2},
+		{"60 across midnight into morning", "60000/1001", "23:59:00;04", "00:01:00;04", true, 7196},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			body := map[string]any{
+				"direction": "timecode_span", "rate": c.rate,
+				"start_timecode": c.start, "end_timecode": c.end,
+			}
+			if c.next {
+				body["next_day"] = true
+			}
+			status, resp := doConvert(t, body)
+			require.Equal(t, http.StatusOK, status, "body: %v", resp)
+			assert.Equal(t, float64(c.want), resp["elapsed_frames"])
+			assert.NotContains(t, resp, "frame_index")
+			assert.NotContains(t, resp, "timecode")
+			assert.NotContains(t, resp, "error")
+		})
+	}
+}
+
+func TestTimecodeSpanEndBeforeStartRejected(t *testing.T) {
+	for _, rate := range []string{"30000/1001", "60000/1001"} {
+		status, body := doConvert(t, map[string]any{
+			"direction": "timecode_span", "rate": rate,
+			"start_timecode": "23:59:59;29", "end_timecode": "00:00:00;00",
+		})
+		assertError(t, status, body, "END_BEFORE_START", "end_timecode")
+	}
+}
+
+func TestTimecodeSpanFieldErrors(t *testing.T) {
+	cases := []struct {
+		name      string
+		body      map[string]any
+		wantCode  string
+		wantField string
+	}{
+		{"missing start", map[string]any{
+			"direction": "timecode_span", "rate": "30000/1001", "end_timecode": "00:10:00;00"},
+			"MISSING_FIELD", "start_timecode"},
+		{"missing end", map[string]any{
+			"direction": "timecode_span", "rate": "30000/1001", "start_timecode": "00:10:00;00"},
+			"MISSING_FIELD", "end_timecode"},
+		{"bad start format", map[string]any{
+			"direction": "timecode_span", "rate": "30000/1001",
+			"start_timecode": "00:10:00:00", "end_timecode": "00:10:00;00"},
+			"INVALID_TIMECODE_FORMAT", "start_timecode"},
+		{"bad end format", map[string]any{
+			"direction": "timecode_span", "rate": "30000/1001",
+			"start_timecode": "00:10:00;00", "end_timecode": "24:00:00;00"},
+			"INVALID_TIMECODE_FORMAT", "end_timecode"},
+		{"dropped start label", map[string]any{
+			"direction": "timecode_span", "rate": "30000/1001",
+			"start_timecode": "00:01:00;01", "end_timecode": "00:10:00;00"},
+			"DROPPED_FRAME_LABEL", "start_timecode"},
+		{"dropped end label", map[string]any{
+			"direction": "timecode_span", "rate": "60000/1001",
+			"start_timecode": "00:10:00;00", "end_timecode": "00:11:00;03"},
+			"DROPPED_FRAME_LABEL", "end_timecode"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			status, body := doConvert(t, c.body)
+			assertError(t, status, body, c.wantCode, c.wantField)
+		})
+	}
+}
+
 func TestMalformedJSON(t *testing.T) {
 	status, body := doConvert(t, "{not json")
 	require.Equal(t, http.StatusBadRequest, status)
@@ -267,4 +352,5 @@ func assertError(t *testing.T, status int, body map[string]any, wantCode, wantFi
 	assert.NotEmpty(t, errObj["message"])
 	assert.NotContains(t, body, "frame_index", "error must not carry partial results")
 	assert.NotContains(t, body, "timecode", "error must not carry partial results")
+	assert.NotContains(t, body, "elapsed_frames", "error must not carry partial results")
 }

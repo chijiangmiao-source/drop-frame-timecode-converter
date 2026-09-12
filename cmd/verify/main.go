@@ -1,6 +1,7 @@
 // Command verify is a one-shot acceptance client: it waits for the API to
-// become healthy, exercises boundary vectors, drop-frame rules and
-// round-trip reversibility over HTTP, then exits non-zero on any failure.
+// become healthy, exercises boundary vectors, drop-frame rules, timecode
+// spans and round-trip reversibility over HTTP, then exits non-zero on any
+// failure.
 package main
 
 import (
@@ -43,6 +44,7 @@ func main() {
 	checkDropFrameRules()
 	checkMinuteContinuity()
 	checkErrorEnvelope()
+	checkTimecodeSpan()
 	checkRoundTrip()
 
 	if failures > 0 {
@@ -139,12 +141,33 @@ func expectError(name string, payload map[string]any, wantCode, wantField string
 	field, _ := errObj["field"].(string)
 	_, leakedFrame := body["frame_index"]
 	_, leakedTC := body["timecode"]
-	if status != http.StatusUnprocessableEntity || code != wantCode || field != wantField || leakedFrame || leakedTC {
+	_, leakedSpan := body["elapsed_frames"]
+	if status != http.StatusUnprocessableEntity || code != wantCode || field != wantField ||
+		leakedFrame || leakedTC || leakedSpan {
 		fail("%s: want 422 code=%s field=%s without partial result, got status=%d body=%v",
 			name, wantCode, wantField, status, body)
 		return
 	}
 	pass("%s: 422 %s on field %q", name, code, field)
+}
+
+// expectSpan asserts a timecode_span conversion returns the expected
+// elapsed frame count.
+func expectSpan(name string, rate rateSpec, start, end string, nextDay bool, want int64) {
+	payload := map[string]any{
+		"direction": "timecode_span", "rate": rate.id,
+		"start_timecode": start, "end_timecode": end,
+	}
+	if nextDay {
+		payload["next_day"] = true
+	}
+	status, body := convert(payload)
+	got, ok := body["elapsed_frames"].(float64)
+	if status != http.StatusOK || !ok || int64(got) != want {
+		fail("%s: want elapsed_frames=%d, got status=%d body=%v", name, want, status, body)
+		return
+	}
+	pass("%s: elapsed_frames=%d", name, want)
 }
 
 func checkBoundaryVectors() {
@@ -276,6 +299,58 @@ func checkErrorEnvelope() {
 	expectError("missing frame_index",
 		map[string]any{"direction": "frame_to_timecode", "rate": rate30.id},
 		"MISSING_FIELD", "frame_index")
+}
+
+// checkTimecodeSpan exercises the timecode_span direction: same-day spans
+// over ten-minute boundaries, midnight rollover at both rates, zero-length
+// spans, and rejection of an unauthorized day rollover.
+func checkTimecodeSpan() {
+	fmt.Println("--- timecode span ---")
+	// Same-day spans across a ten-minute boundary (labels stay continuous).
+	expectSpan("rate=30000/1001 same-day ten-minute boundary", rate30,
+		"00:09:59;29", "00:10:00;01", false, 2)
+	expectSpan("rate=60000/1001 same-day ten-minute boundary", rate60,
+		"00:09:59;59", "00:10:00;03", false, 4)
+
+	// Identical endpoints span zero frames.
+	expectSpan("rate=30000/1001 same frame", rate30,
+		"00:10:00;00", "00:10:00;00", false, 0)
+	expectSpan("rate=60000/1001 same frame", rate60,
+		"01:00:00;04", "01:00:00;04", false, 0)
+
+	// Midnight rollover, one day at most, only with next_day=true.
+	expectSpan("rate=30000/1001 across midnight", rate30,
+		"23:59:59;29", "00:00:00;00", true, 1)
+	expectSpan("rate=30000/1001 across midnight into morning", rate30,
+		"23:59:00;02", "00:01:00;02", true, 3598)
+	expectSpan("rate=60000/1001 across midnight", rate60,
+		"23:59:59;59", "00:00:00;01", true, 2)
+	expectSpan("rate=60000/1001 across midnight into morning", rate60,
+		"23:59:00;04", "00:01:00;04", true, 7196)
+
+	// End before start without next_day is rejected and carries no span.
+	expectError("end before start without next_day (30000/1001)",
+		map[string]any{"direction": "timecode_span", "rate": rate30.id,
+			"start_timecode": "23:59:59;29", "end_timecode": "00:00:00;00"},
+		"END_BEFORE_START", "end_timecode")
+	expectError("end before start without next_day (60000/1001)",
+		map[string]any{"direction": "timecode_span", "rate": rate60.id,
+			"start_timecode": "23:59:59;59", "end_timecode": "00:00:00;00"},
+		"END_BEFORE_START", "end_timecode")
+
+	// Field-level validation matches the other directions.
+	expectError("span missing end_timecode",
+		map[string]any{"direction": "timecode_span", "rate": rate30.id,
+			"start_timecode": "00:10:00;00"},
+		"MISSING_FIELD", "end_timecode")
+	expectError("span dropped start label",
+		map[string]any{"direction": "timecode_span", "rate": rate30.id,
+			"start_timecode": "00:01:00;01", "end_timecode": "00:10:00;00"},
+		"DROPPED_FRAME_LABEL", "start_timecode")
+	expectError("span bad end format",
+		map[string]any{"direction": "timecode_span", "rate": rate30.id,
+			"start_timecode": "00:10:00;00", "end_timecode": "00:10:00:00"},
+		"INVALID_TIMECODE_FORMAT", "end_timecode")
 }
 
 func checkRoundTrip() {
