@@ -28,6 +28,7 @@ const (
 	CodeFrameIndexOutOfRange  Code = "FRAME_INDEX_OUT_OF_RANGE"
 	CodeEndBeforeStart        Code = "END_BEFORE_START"
 	CodeOffsetOutOfRange      Code = "OFFSET_OUT_OF_RANGE"
+	CodeTimecodeNotAligned    Code = "TIMECODE_NOT_ALIGNED"
 )
 
 // Error describes a single invalid input field.
@@ -310,4 +311,41 @@ func OffsetTimecode(rate Rate, tc string, frameOffset int64) (OffsetResult, erro
 		return OffsetResult{}, err
 	}
 	return OffsetResult{Timecode: target, DayOffset: int(dayOffset)}, nil
+}
+
+// RetimeTimecode maps a timecode label from the source rate to the target
+// rate, for migrating locate points between projects that mix the two supported
+// rates. The source label is fully validated (format, ranges, drop-frame
+// legality) and resolved to its frame index, which is then mapped by the 2:1
+// relationship of the nominal rates: 30000/1001 -> 60000/1001 doubles the
+// index, 60000/1001 -> 30000/1001 halves it. Halving is only exact for even
+// indices, so a 60000/1001 label that lands on a half-frame position of the
+// 30000/1001 grid (odd index) is rejected with TIMECODE_NOT_ALIGNED on field
+// "timecode"; this keeps every accepted mapping exactly reversible in both
+// directions. When source and target are the same rate the validated label
+// is returned unchanged.
+func RetimeTimecode(source, target Rate, tc string) (string, error) {
+	index, err := FrameIndexFromTimecode(source, tc)
+	if err != nil {
+		return "", err
+	}
+	if source == target {
+		return tc, nil
+	}
+
+	var mapped int64
+	if source.nominalFPS < target.nominalFPS {
+		mapped = index * 2
+	} else {
+		if index%2 != 0 {
+			return "", &Error{
+				Code:  CodeTimecodeNotAligned,
+				Field: "timecode",
+				Message: fmt.Sprintf("timecode %q at rate %s falls on a half-frame position of rate %s and has no exact target label",
+					tc, source.id, target.id),
+			}
+		}
+		mapped = index / 2
+	}
+	return TimecodeFromFrameIndex(target, mapped)
 }

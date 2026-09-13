@@ -8,6 +8,7 @@
 - 反向：帧序号 → 当日唯一合法时间码标签
 - 跨度：两个时间码 → 实际帧间隔（不含起点帧），可选跨零点续算，避免客户端各自处理日期翻转
 - 偏移：时间码 + 带符号整数帧数 → 目标时间码与日期位移（前一日 -1、当日 0、次日 1），结果只落在相邻自然日，剪辑点前移或跨午夜后移均由服务端归一化
+- 帧率迁移：源帧率 + 目标帧率 + 时间码 → 目标帧率下的对应时间码，供混用两种帧率的工程间迁移定位点；按帧序号的二倍关系精确映射，60 fps 侧落在 30 fps 侧半帧位置的定位点返回 422，不用浮点秒数换算
 - 全部换算基于公式实时计算，正反两个方向互为逆运算，可逆定位
 
 ## 丢帧规则
@@ -29,7 +30,7 @@ API_PORT=9000 docker compose up --build
 docker compose up --build --abort-on-container-exit verify
 ```
 
-`verify` 服务等待 API 健康后执行验收：边界向量、丢帧标签非法性、1440 次分钟连续衔接（含十分钟边界）、时间码跨度（同日、跨午夜、零跨度与未授权跨日拒绝）、时间码偏移（两种帧率的零偏移、十分钟边界前移、末帧跨次日首帧与越界拒绝）、错误响应格式、抽样回环可逆性，全部通过则以退出码 0 结束，否则非 0。
+`verify` 服务等待 API 健康后执行验收：边界向量、丢帧标签非法性、1440 次分钟连续衔接（含十分钟边界）、时间码跨度（同日、跨午夜、零跨度与未授权跨日拒绝）、时间码偏移（两种帧率的零偏移、十分钟边界前移、末帧跨次日首帧与越界拒绝）、帧率迁移（同帧率直返、双向十分钟边界映射、30→60→30 往返一致与半帧位置拒绝）、错误响应格式、抽样回环可逆性，全部通过则以退出码 0 结束，否则非 0。
 
 本地开发（需要 Go 1.25）：
 
@@ -40,7 +41,7 @@ go run ./cmd/api     # 监听 :8080，可用 LISTEN_ADDR 覆盖
 
 ## 请求示例
 
-`POST /api/v1/convert`，请求体包含 `direction`、`rate`，以及按方向选择的 `timecode`、`frame_index`、`start_timecode` + `end_timecode`（可选 `next_day`）或 `timecode` + 整数 `frame_offset`。
+`POST /api/v1/convert`，请求体包含 `direction`、`rate`（`timecode_retime` 为 `source_rate` + `target_rate`），以及按方向选择的 `timecode`、`frame_index`、`start_timecode` + `end_timecode`（可选 `next_day`）或 `timecode` + 整数 `frame_offset`。
 
 正向换算（时间码 → 帧序号）：
 
@@ -118,6 +119,32 @@ curl -s -X POST http://localhost:8080/api/v1/convert \
 
 结果仅可落在相邻自然日：偏移按当日总帧数（30 fps 为 2589408 帧、60 fps 为 5178816 帧）归一化，例如从当日末帧后移一整天恰好到次日末帧仍合法，再多一帧即越过次日，返回 422 `OFFSET_OUT_OF_RANGE`（指向 `frame_offset`）且不携带目标值。
 
+帧率迁移（源帧率 + 目标帧率 + 时间码 → 目标帧率时间码）。在混用两种帧率的工程间迁移定位点时，服务端先把源标签解析为帧序号，再按两种帧率的二倍关系映射：30 fps → 60 fps 将序号乘二，60 fps → 30 fps 仅在序号为偶数时除二，因此往返定位完全一致；源与目标帧率相同时原样返回标签。
+
+30 fps 定位点迁入 60 fps 工程（十分钟边界前一帧 `00:09:59;29` 映射为 `00:09:59;58`）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/convert \
+  -H 'Content-Type: application/json' \
+  -d '{"direction":"timecode_retime","source_rate":"30000/1001","target_rate":"60000/1001","timecode":"00:09:59;29"}'
+```
+
+```json
+{"timecode": "00:09:59;58"}
+```
+
+反向迁移时，60 fps 侧落在 30 fps 侧半帧位置的定位点（帧序号为奇数）没有精确对应标签，返回 422 `TIMECODE_NOT_ALIGNED`（指向 `timecode`）且不携带目标值：
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/convert \
+  -H 'Content-Type: application/json' \
+  -d '{"direction":"timecode_retime","source_rate":"60000/1001","target_rate":"30000/1001","timecode":"00:10:00;01"}'
+```
+
+```json
+{"error": {"code": "TIMECODE_NOT_ALIGNED", "field": "timecode", "message": "timecode \"00:10:00;01\" at rate 60000/1001 falls on a half-frame position of rate 30000/1001 and has no exact target label"}}
+```
+
 请求被跳过的丢帧标签：
 
 ```bash
@@ -134,8 +161,9 @@ curl -s -X POST http://localhost:8080/api/v1/convert \
 
 | 字段 | 约束 |
 | --- | --- |
-| `direction` | `timecode_to_frame`、`frame_to_timecode`、`timecode_span` 或 `timecode_offset` |
-| `rate` | `30000/1001` 或 `60000/1001` |
+| `direction` | `timecode_to_frame`、`frame_to_timecode`、`timecode_span`、`timecode_offset` 或 `timecode_retime` |
+| `rate` | `30000/1001` 或 `60000/1001`（`timecode_retime` 不使用） |
+| `source_rate` / `target_rate` | 仅 `timecode_retime`；约束同 `rate`，二者相同则原样返回标签 |
 | `timecode` | 严格 `HH:MM:SS;FF`；HH 00-23，MM/SS 00-59；FF 上限 29（30 fps）或 59（60 fps）；不得为被跳过的标签 |
 | `frame_index` | 整数，`0` 至当日最后合法帧（含） |
 | `frame_offset` | 仅 `timecode_offset`；带符号整数帧数。结果归一化到前一日、当日或次日；越过相邻自然日返回 422 `OFFSET_OUT_OF_RANGE` |
@@ -153,13 +181,14 @@ curl -s -X POST http://localhost:8080/api/v1/convert \
 | 错误码 | 字段 | 含义 |
 | --- | --- | --- |
 | `INVALID_DIRECTION` | `direction` | 方向取值不支持 |
-| `INVALID_RATE` | `rate` | 帧率取值不支持 |
+| `INVALID_RATE` | `rate` / `source_rate` / `target_rate` | 帧率取值不支持 |
 | `MISSING_FIELD` | `timecode` / `frame_index` / `frame_offset` / `start_timecode` / `end_timecode` | 当前方向必需的字段缺失 |
 | `INVALID_TIMECODE_FORMAT` | `timecode` / `start_timecode` / `end_timecode` | 格式或分量越界 |
 | `DROPPED_FRAME_LABEL` | `timecode` / `start_timecode` / `end_timecode` | 被丢帧规则跳过的标签 |
 | `FRAME_INDEX_OUT_OF_RANGE` | `frame_index` | 负数或越过当日最后合法帧 |
 | `OFFSET_OUT_OF_RANGE` | `frame_offset` | 偏移后越过前一日或次日（结果只能落在相邻自然日） |
 | `END_BEFORE_START` | `end_timecode` | 终点早于起点且未提交 `next_day=true` |
+| `TIMECODE_NOT_ALIGNED` | `timecode` | 60 fps 定位点落在 30 fps 侧的半帧位置，无精确目标标签 |
 | `AMBIGUOUS_FIELD` | 冲突字段 | 同一字段重复出现且取值不同，请求含义不唯一 |
 | `MALFORMED_JSON` | — | 请求体不是单一、合法 JSON 对象（HTTP 400） |
 

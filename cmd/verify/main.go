@@ -46,6 +46,7 @@ func main() {
 	checkErrorEnvelope()
 	checkTimecodeSpan()
 	checkTimecodeOffset()
+	checkTimecodeRetime()
 	checkRoundTrip()
 
 	if failures > 0 {
@@ -447,6 +448,89 @@ func checkTimecodeOffset() {
 	} else {
 		pass("trailing JSON rejected with 400 MALFORMED_JSON")
 	}
+}
+
+// expectRetime asserts a timecode_retime conversion maps the source label to
+// the expected target label.
+func expectRetime(name, sourceRate, targetRate, tc, want string) {
+	status, body := convert(map[string]any{
+		"direction": "timecode_retime", "source_rate": sourceRate,
+		"target_rate": targetRate, "timecode": tc,
+	})
+	got, ok := body["timecode"].(string)
+	if status != http.StatusOK || !ok || got != want {
+		fail("%s: want timecode=%s, got status=%d body=%v", name, want, status, body)
+		return
+	}
+	pass("%s: %s -> %s", name, tc, want)
+}
+
+// checkTimecodeRetime exercises the timecode_retime direction: same-rate
+// passthrough, the bidirectional mapping across the ten-minute boundary,
+// exact 30 -> 60 -> 30 round trips, rejection of half-frame positions, and
+// field-level validation.
+func checkTimecodeRetime() {
+	fmt.Println("--- timecode retime ---")
+	// Same source and target rate returns the label unchanged.
+	expectRetime("same rate 30000/1001", rate30.id, rate30.id, "00:10:00;00", "00:10:00;00")
+	expectRetime("same rate 60000/1001", rate60.id, rate60.id, "00:10:00;00", "00:10:00;00")
+
+	// Bidirectional mapping across the ten-minute boundary.
+	expectRetime("30 -> 60 last frame before ten-minute boundary",
+		rate30.id, rate60.id, "00:09:59;29", "00:09:59;58")
+	expectRetime("30 -> 60 ten-minute boundary",
+		rate30.id, rate60.id, "00:10:00;00", "00:10:00;00")
+	expectRetime("60 -> 30 aligned frame before ten-minute boundary",
+		rate60.id, rate30.id, "00:09:59;58", "00:09:59;29")
+	expectRetime("60 -> 30 ten-minute boundary",
+		rate60.id, rate30.id, "00:10:00;00", "00:10:00;00")
+
+	// A 30 fps locate point survives the round trip 30 -> 60 -> 30 exactly.
+	status, body := convert(map[string]any{
+		"direction": "timecode_retime", "source_rate": rate30.id,
+		"target_rate": rate60.id, "timecode": "00:09:59;29",
+	})
+	mid, _ := body["timecode"].(string)
+	status2, body2 := convert(map[string]any{
+		"direction": "timecode_retime", "source_rate": rate60.id,
+		"target_rate": rate30.id, "timecode": mid,
+	})
+	back, _ := body2["timecode"].(string)
+	if status != http.StatusOK || status2 != http.StatusOK || back != "00:09:59;29" {
+		fail("30 -> 60 -> 30 round trip: want 00:09:59;29, got mid=%q back=%q (bodies %v, %v)",
+			mid, back, body, body2)
+	} else {
+		pass("30 -> 60 -> 30 round trip: 00:09:59;29 -> %s -> %s", mid, back)
+	}
+
+	// A 60 fps label on a half-frame position of the 30 fps grid is rejected
+	// and carries no target value.
+	expectError("60 -> 30 half-frame position",
+		map[string]any{"direction": "timecode_retime", "source_rate": rate60.id,
+			"target_rate": rate30.id, "timecode": "00:10:00;01"},
+		"TIMECODE_NOT_ALIGNED", "timecode")
+	expectError("60 -> 30 last frame of day is a half-frame position",
+		map[string]any{"direction": "timecode_retime", "source_rate": rate60.id,
+			"target_rate": rate30.id, "timecode": "23:59:59;59"},
+		"TIMECODE_NOT_ALIGNED", "timecode")
+
+	// Field-level validation matches the other directions.
+	expectError("retime invalid source_rate",
+		map[string]any{"direction": "timecode_retime", "source_rate": "25",
+			"target_rate": rate60.id, "timecode": "00:10:00;00"},
+		"INVALID_RATE", "source_rate")
+	expectError("retime invalid target_rate",
+		map[string]any{"direction": "timecode_retime", "source_rate": rate30.id,
+			"target_rate": "29.97", "timecode": "00:10:00;00"},
+		"INVALID_RATE", "target_rate")
+	expectError("retime missing timecode",
+		map[string]any{"direction": "timecode_retime", "source_rate": rate30.id,
+			"target_rate": rate60.id},
+		"MISSING_FIELD", "timecode")
+	expectError("retime dropped source label",
+		map[string]any{"direction": "timecode_retime", "source_rate": rate30.id,
+			"target_rate": rate60.id, "timecode": "00:01:00;01"},
+		"DROPPED_FRAME_LABEL", "timecode")
 }
 
 func checkRoundTrip() {

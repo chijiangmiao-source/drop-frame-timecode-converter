@@ -404,6 +404,165 @@ func TestTimecodeOffsetTrailingJSONRejected(t *testing.T) {
 	assert.NotContains(t, resp, "timecode")
 }
 
+func TestTimecodeRetime(t *testing.T) {
+	cases := []struct {
+		name       string
+		sourceRate string
+		targetRate string
+		tc         string
+		want       string
+	}{
+		{"same rate 30 returns label unchanged", "30000/1001", "30000/1001", "00:10:00;00", "00:10:00;00"},
+		{"same rate 60 returns label unchanged", "60000/1001", "60000/1001", "00:10:00;00", "00:10:00;00"},
+		{"30 to 60 first frame of day", "30000/1001", "60000/1001", "00:00:00;00", "00:00:00;00"},
+		{"30 to 60 last frame before ten-minute boundary", "30000/1001", "60000/1001", "00:09:59;29", "00:09:59;58"},
+		{"30 to 60 ten-minute boundary", "30000/1001", "60000/1001", "00:10:00;00", "00:10:00;00"},
+		{"30 to 60 one hour mark", "30000/1001", "60000/1001", "01:00:00;02", "01:00:00;04"},
+		{"30 to 60 last frame of day", "30000/1001", "60000/1001", "23:59:59;29", "23:59:59;58"},
+		{"60 to 30 first frame of day", "60000/1001", "30000/1001", "00:00:00;00", "00:00:00;00"},
+		{"60 to 30 aligned frame before ten-minute boundary", "60000/1001", "30000/1001", "00:09:59;58", "00:09:59;29"},
+		{"60 to 30 ten-minute boundary", "60000/1001", "30000/1001", "00:10:00;00", "00:10:00;00"},
+		{"60 to 30 one hour mark", "60000/1001", "30000/1001", "01:00:00;04", "01:00:00;02"},
+		{"60 to 30 last aligned frame of day", "60000/1001", "30000/1001", "23:59:59;58", "23:59:59;29"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			status, body := doConvert(t, map[string]any{
+				"direction": "timecode_retime", "source_rate": c.sourceRate,
+				"target_rate": c.targetRate, "timecode": c.tc,
+			})
+			require.Equal(t, http.StatusOK, status, "body: %v", body)
+			assert.Equal(t, c.want, body["timecode"])
+			assert.NotContains(t, body, "frame_index")
+			assert.NotContains(t, body, "elapsed_frames")
+			assert.NotContains(t, body, "error")
+		})
+	}
+}
+
+func TestTimecodeRetimeRoundTrip(t *testing.T) {
+	// A 30 fps locate point survives the round trip 30 -> 60 -> 30 exactly.
+	for _, tc := range []string{
+		"00:00:00;00", "00:01:00;02", "00:09:59;29", "00:10:00;00",
+		"00:10:00;01", "01:00:00;02", "23:59:59;29",
+	} {
+		status, body := doConvert(t, map[string]any{
+			"direction": "timecode_retime", "source_rate": "30000/1001",
+			"target_rate": "60000/1001", "timecode": tc,
+		})
+		require.Equal(t, http.StatusOK, status, "body: %v", body)
+		mid, ok := body["timecode"].(string)
+		require.True(t, ok)
+
+		status2, body2 := doConvert(t, map[string]any{
+			"direction": "timecode_retime", "source_rate": "60000/1001",
+			"target_rate": "30000/1001", "timecode": mid,
+		})
+		require.Equal(t, http.StatusOK, status2, "body: %v", body2)
+		assert.Equal(t, tc, body2["timecode"], "round trip %s -> %s", tc, mid)
+	}
+}
+
+func TestTimecodeRetimeNotAligned(t *testing.T) {
+	cases := []struct {
+		name string
+		tc   string
+	}{
+		{"odd frame at start of day", "00:00:00;01"},
+		{"odd frame mid-minute", "00:05:23;45"},
+		{"odd frame at ten-minute boundary", "00:10:00;01"},
+		{"odd frame before ten-minute boundary", "00:09:59;59"},
+		{"last frame of day is odd", "23:59:59;59"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			status, body := doConvert(t, map[string]any{
+				"direction": "timecode_retime", "source_rate": "60000/1001",
+				"target_rate": "30000/1001", "timecode": c.tc,
+			})
+			assertError(t, status, body, "TIMECODE_NOT_ALIGNED", "timecode")
+		})
+	}
+}
+
+func TestTimecodeRetimeFieldErrors(t *testing.T) {
+	cases := []struct {
+		name      string
+		body      map[string]any
+		wantCode  string
+		wantField string
+	}{
+		{"invalid source_rate", map[string]any{
+			"direction": "timecode_retime", "source_rate": "25",
+			"target_rate": "60000/1001", "timecode": "00:10:00;00"},
+			"INVALID_RATE", "source_rate"},
+		{"missing source_rate", map[string]any{
+			"direction": "timecode_retime",
+			"target_rate": "60000/1001", "timecode": "00:10:00;00"},
+			"INVALID_RATE", "source_rate"},
+		{"invalid target_rate", map[string]any{
+			"direction": "timecode_retime", "source_rate": "30000/1001",
+			"target_rate": "29.97", "timecode": "00:10:00;00"},
+			"INVALID_RATE", "target_rate"},
+		{"missing target_rate", map[string]any{
+			"direction": "timecode_retime", "source_rate": "30000/1001",
+			"timecode": "00:10:00;00"},
+			"INVALID_RATE", "target_rate"},
+		{"missing timecode", map[string]any{
+			"direction": "timecode_retime", "source_rate": "30000/1001",
+			"target_rate": "60000/1001"},
+			"MISSING_FIELD", "timecode"},
+		{"bad timecode format", map[string]any{
+			"direction": "timecode_retime", "source_rate": "30000/1001",
+			"target_rate": "60000/1001", "timecode": "00:10:00:00"},
+			"INVALID_TIMECODE_FORMAT", "timecode"},
+		{"dropped source label", map[string]any{
+			"direction": "timecode_retime", "source_rate": "30000/1001",
+			"target_rate": "60000/1001", "timecode": "00:01:00;01"},
+			"DROPPED_FRAME_LABEL", "timecode"},
+		{"dropped source label same rate", map[string]any{
+			"direction": "timecode_retime", "source_rate": "60000/1001",
+			"target_rate": "60000/1001", "timecode": "00:01:00;03"},
+			"DROPPED_FRAME_LABEL", "timecode"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			status, body := doConvert(t, c.body)
+			assertError(t, status, body, c.wantCode, c.wantField)
+		})
+	}
+}
+
+func TestTimecodeRetimeAmbiguousFieldsRejected(t *testing.T) {
+	base := `"direction":"timecode_retime","source_rate":"30000/1001","target_rate":"60000/1001","timecode":"00:10:00;00"`
+	cases := []struct {
+		name      string
+		body      string
+		wantField string
+	}{
+		{"duplicate source_rate with different values", `{` + base + `,"source_rate":"60000/1001"}`, "source_rate"},
+		{"duplicate target_rate with different values", `{` + base + `,"target_rate":"30000/1001"}`, "target_rate"},
+		{"duplicate timecode with different values", `{` + base + `,"timecode":"00:10:00;01"}`, "timecode"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			status, body := doConvert(t, c.body)
+			assertError(t, status, body, "AMBIGUOUS_FIELD", c.wantField)
+		})
+	}
+}
+
+func TestTimecodeRetimeTrailingJSONRejected(t *testing.T) {
+	body := `{"direction":"timecode_retime","source_rate":"30000/1001",` +
+		`"target_rate":"60000/1001","timecode":"00:10:00;00"}{"direction":"timecode_to_frame"}`
+	status, resp := doConvert(t, body)
+	require.Equal(t, http.StatusBadRequest, status)
+	errObj, ok := resp["error"].(map[string]any)
+	require.True(t, ok, "error envelope missing: %v", resp)
+	assert.Equal(t, "MALFORMED_JSON", errObj["code"])
+	assert.NotContains(t, resp, "timecode")
+}
+
 func TestTimecodeSpanEndBeforeStartRejected(t *testing.T) {
 	for _, rate := range []string{"30000/1001", "60000/1001"} {
 		status, body := doConvert(t, map[string]any{

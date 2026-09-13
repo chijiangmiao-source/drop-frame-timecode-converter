@@ -16,11 +16,14 @@ const (
 	DirectionFrameToTimecode = "frame_to_timecode"
 	DirectionTimecodeSpan    = "timecode_span"
 	DirectionTimecodeOffset  = "timecode_offset"
+	DirectionTimecodeRetime  = "timecode_retime"
 )
 
 type convertRequest struct {
 	Direction     string  `json:"direction"`
 	Rate          string  `json:"rate"`
+	SourceRate    string  `json:"source_rate"`
+	TargetRate    string  `json:"target_rate"`
 	Timecode      *string `json:"timecode"`
 	FrameIndex    *int64  `json:"frame_index"`
 	FrameOffset   *int64  `json:"frame_offset"`
@@ -78,9 +81,15 @@ func handleConvert(c *gin.Context) {
 	}
 
 	if req.Direction != DirectionTimecodeToFrame && req.Direction != DirectionFrameToTimecode &&
-		req.Direction != DirectionTimecodeSpan && req.Direction != DirectionTimecodeOffset {
+		req.Direction != DirectionTimecodeSpan && req.Direction != DirectionTimecodeOffset &&
+		req.Direction != DirectionTimecodeRetime {
 		respondError(c, http.StatusUnprocessableEntity, timecode.CodeInvalidDirection, "direction",
-			"direction must be \"timecode_to_frame\", \"frame_to_timecode\", \"timecode_span\" or \"timecode_offset\"")
+			"direction must be \"timecode_to_frame\", \"frame_to_timecode\", \"timecode_span\", \"timecode_offset\" or \"timecode_retime\"")
+		return
+	}
+
+	if req.Direction == DirectionTimecodeRetime {
+		handleTimecodeRetime(c, req)
 		return
 	}
 
@@ -154,4 +163,32 @@ func handleConvert(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"timecode": result.Timecode, "day_offset": result.DayOffset})
 	}
+}
+
+// handleTimecodeRetime migrates a locate point between the two supported
+// rates: it takes source_rate, target_rate and timecode instead of rate.
+func handleTimecodeRetime(c *gin.Context, req convertRequest) {
+	source, ok := timecode.ParseRate(req.SourceRate)
+	if !ok {
+		respondError(c, http.StatusUnprocessableEntity, timecode.CodeInvalidRate, "source_rate",
+			"source_rate must be \"30000/1001\" or \"60000/1001\"")
+		return
+	}
+	target, ok := timecode.ParseRate(req.TargetRate)
+	if !ok {
+		respondError(c, http.StatusUnprocessableEntity, timecode.CodeInvalidRate, "target_rate",
+			"target_rate must be \"30000/1001\" or \"60000/1001\"")
+		return
+	}
+	if req.Timecode == nil {
+		respondError(c, http.StatusUnprocessableEntity, timecode.CodeMissingField, "timecode",
+			"timecode is required when direction is \"timecode_retime\"")
+		return
+	}
+	tc, err := timecode.RetimeTimecode(source, target, *req.Timecode)
+	if err != nil {
+		respondConversionError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"timecode": tc})
 }

@@ -274,6 +274,145 @@ func lastFrameDigits(rate Rate) string {
 	return "59"
 }
 
+func TestRetimeTimecode(t *testing.T) {
+	cases := []struct {
+		name   string
+		source Rate
+		target Rate
+		tc     string
+		want   string
+	}{
+		{"same rate 30 returns label unchanged", Rate2997, Rate2997, "00:10:00;00", "00:10:00;00"},
+		{"same rate 60 returns label unchanged", Rate5994, Rate5994, "00:10:00;00", "00:10:00;00"},
+		{"same rate 30 at dropped-minute first legal label", Rate2997, Rate2997, "00:01:00;02", "00:01:00;02"},
+		{"30 to 60 first frame of day", Rate2997, Rate5994, "00:00:00;00", "00:00:00;00"},
+		{"30 to 60 across dropped minute", Rate2997, Rate5994, "00:01:00;02", "00:01:00;04"},
+		{"30 to 60 last frame before ten-minute boundary", Rate2997, Rate5994, "00:09:59;29", "00:09:59;58"},
+		{"30 to 60 ten-minute boundary", Rate2997, Rate5994, "00:10:00;00", "00:10:00;00"},
+		{"30 to 60 one hour mark", Rate2997, Rate5994, "01:00:00;02", "01:00:00;04"},
+		{"30 to 60 last frame of day", Rate2997, Rate5994, "23:59:59;29", "23:59:59;58"},
+		{"60 to 30 first frame of day", Rate5994, Rate2997, "00:00:00;00", "00:00:00;00"},
+		{"60 to 30 across dropped minute", Rate5994, Rate2997, "00:01:00;04", "00:01:00;02"},
+		{"60 to 30 aligned frame before ten-minute boundary", Rate5994, Rate2997, "00:09:59;58", "00:09:59;29"},
+		{"60 to 30 ten-minute boundary", Rate5994, Rate2997, "00:10:00;00", "00:10:00;00"},
+		{"60 to 30 one hour mark", Rate5994, Rate2997, "01:00:00;04", "01:00:00;02"},
+		{"60 to 30 last aligned frame of day", Rate5994, Rate2997, "23:59:59;58", "23:59:59;29"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := RetimeTimecode(c.source, c.target, c.tc)
+			if err != nil {
+				t.Fatalf("RetimeTimecode(%s, %s, %q) error: %v",
+					c.source.ID(), c.target.ID(), c.tc, err)
+			}
+			if got != c.want {
+				t.Errorf("RetimeTimecode(%s, %s, %q) = %q, want %q",
+					c.source.ID(), c.target.ID(), c.tc, got, c.want)
+			}
+		})
+	}
+}
+
+func TestRetimeTimecodeNotAligned(t *testing.T) {
+	cases := []struct {
+		name string
+		tc   string
+	}{
+		{"odd frame at start of day", "00:00:00;01"},
+		{"odd frame mid-minute", "00:05:23;45"},
+		{"odd frame at ten-minute boundary", "00:10:00;01"},
+		{"odd frame before ten-minute boundary", "00:09:59;59"},
+		{"last frame of day is odd", "23:59:59;59"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := RetimeTimecode(Rate5994, Rate2997, c.tc)
+			te, ok := err.(*Error)
+			if !ok || te.Code != CodeTimecodeNotAligned || te.Field != "timecode" {
+				t.Errorf("RetimeTimecode(60000/1001, 30000/1001, %q): want TIMECODE_NOT_ALIGNED on timecode, got %q err=%v",
+					c.tc, got, err)
+			}
+			if got != "" {
+				t.Errorf("RetimeTimecode(60000/1001, 30000/1001, %q): rejection must not carry a target, got %q",
+					c.tc, got)
+			}
+		})
+	}
+}
+
+func TestRetimeTimecodeReusesLabelValidation(t *testing.T) {
+	cases := []struct {
+		name      string
+		source    Rate
+		target    Rate
+		tc        string
+		wantCode  Code
+		wantField string
+	}{
+		{"bad format", Rate2997, Rate5994, "00:10:00:00", CodeInvalidTimecodeFormat, "timecode"},
+		{"dropped label at 30", Rate2997, Rate5994, "00:01:00;01", CodeDroppedFrameLabel, "timecode"},
+		{"dropped label at 60", Rate5994, Rate2997, "00:01:00;03", CodeDroppedFrameLabel, "timecode"},
+		{"dropped label same rate", Rate2997, Rate2997, "00:01:00;00", CodeDroppedFrameLabel, "timecode"},
+		{"frame out of range for source rate", Rate2997, Rate5994, "00:00:00;30", CodeInvalidTimecodeFormat, "timecode"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := RetimeTimecode(c.source, c.target, c.tc)
+			te, ok := err.(*Error)
+			if !ok || te.Code != c.wantCode || te.Field != c.wantField {
+				t.Errorf("RetimeTimecode(%s, %s, %q): want %s on %s, got %v",
+					c.source.ID(), c.target.ID(), c.tc, c.wantCode, c.wantField, err)
+			}
+		})
+	}
+}
+
+// TestRetimeRoundTripExhaustive proves that every 30000/1001 label survives
+// the round trip 30 -> 60 -> 30 exactly, every even 60000/1001 index survives
+// 60 -> 30 -> 60, and every odd 60000/1001 index is rejected as not aligned.
+func TestRetimeRoundTripExhaustive(t *testing.T) {
+	for i := int64(0); i <= MaxFrameIndex(Rate2997); i++ {
+		tc30, err := TimecodeFromFrameIndex(Rate2997, i)
+		if err != nil {
+			t.Fatalf("30000/1001 index %d: %v", i, err)
+		}
+		tc60, err := RetimeTimecode(Rate2997, Rate5994, tc30)
+		if err != nil {
+			t.Fatalf("30 -> 60 %q: %v", tc30, err)
+		}
+		back, err := RetimeTimecode(Rate5994, Rate2997, tc60)
+		if err != nil {
+			t.Fatalf("60 -> 30 %q: %v", tc60, err)
+		}
+		if back != tc30 {
+			t.Fatalf("round trip broken: %q -> %q -> %q", tc30, tc60, back)
+		}
+	}
+	for i := int64(0); i <= MaxFrameIndex(Rate5994); i++ {
+		tc60, err := TimecodeFromFrameIndex(Rate5994, i)
+		if err != nil {
+			t.Fatalf("60000/1001 index %d: %v", i, err)
+		}
+		if i%2 == 0 {
+			tc30, err := RetimeTimecode(Rate5994, Rate2997, tc60)
+			if err != nil {
+				t.Fatalf("60 -> 30 even index %d %q: %v", i, tc60, err)
+			}
+			back, err := RetimeTimecode(Rate2997, Rate5994, tc30)
+			if err != nil {
+				t.Fatalf("30 -> 60 %q: %v", tc30, err)
+			}
+			if back != tc60 {
+				t.Fatalf("round trip broken: %q -> %q -> %q", tc60, tc30, back)
+			}
+		} else {
+			if _, err := RetimeTimecode(Rate5994, Rate2997, tc60); err == nil {
+				t.Fatalf("60 -> 30 odd index %d %q: want TIMECODE_NOT_ALIGNED, got no error", i, tc60)
+			}
+		}
+	}
+}
+
 func TestSpanFramesFieldErrors(t *testing.T) {
 	cases := []struct {
 		name      string
