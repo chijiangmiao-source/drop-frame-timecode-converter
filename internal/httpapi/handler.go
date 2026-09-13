@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"dropframe-api/internal/audit"
 	"dropframe-api/internal/timecode"
 )
 
@@ -63,6 +64,10 @@ func NewRouter() *gin.Engine {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 	r.POST("/api/v1/convert", handleConvert)
+
+	audits := audit.NewRepository()
+	r.POST("/api/v1/audits", handleCreateAudit(audits))
+	r.GET("/api/v1/audits/:id", handleGetAudit(audits))
 	return r
 }
 

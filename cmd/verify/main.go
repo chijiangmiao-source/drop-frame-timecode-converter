@@ -48,6 +48,7 @@ func main() {
 	checkTimecodeOffset()
 	checkTimecodeRetime()
 	checkCaseVariantAmbiguity()
+	checkTimelineAudit()
 	checkRoundTrip()
 
 	if failures > 0 {
@@ -585,6 +586,170 @@ func checkCaseVariantAmbiguity() {
 		fail("same-value case variant: want 200 migrated label, got status=%d body=%v", status, body)
 	} else {
 		pass("same-value case variant accepted")
+	}
+}
+
+// auditRequest issues one request against the audit endpoints and returns
+// status plus decoded body. A nil payload issues a GET, otherwise a POST.
+func auditRequest(method, path string, payload map[string]any) (int, map[string]any) {
+	var body io.Reader
+	if payload != nil {
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			fail("marshal request: %v", err)
+			return 0, nil
+		}
+		body = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequest(method, baseURL+path, body)
+	if err != nil {
+		fail("build request: %v", err)
+		return 0, nil
+	}
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		fail("%s %s: %v", method, path, err)
+		return 0, nil
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fail("read response: %v", err)
+		return resp.StatusCode, nil
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		fail("response is not JSON: %v (body: %s)", err, raw)
+		return resp.StatusCode, nil
+	}
+	return resp.StatusCode, decoded
+}
+
+// checkTimelineAudit exercises the timeline audit endpoints: a contiguous
+// timeline passes and is readable by its audit number, gaps and overlaps are
+// reported in order with both segment identifiers and frame counts, invalid
+// segment lists are rejected without storing a report, and unknown audit
+// numbers return a stable not-found error.
+func checkTimelineAudit() {
+	fmt.Println("--- timeline audit ---")
+
+	// Contiguous timeline, including across a dropped-minute boundary where
+	// the labels jump while the real frame indices stay continuous.
+	status, body := auditRequest(http.MethodPost, "/api/v1/audits", map[string]any{
+		"rate": rate30.id,
+		"segments": []map[string]any{
+			{"id": "seg-1", "in": "00:00:00;00", "out": "00:00:59;29"},
+			{"id": "seg-2", "in": "00:01:00;02", "out": "00:09:59;29"},
+			{"id": "seg-3", "in": "00:10:00;00", "out": "00:10:00;00"},
+		},
+	})
+	auditID, _ := body["audit_id"].(string)
+	issues, _ := body["issues"].([]any)
+	if status != http.StatusCreated || body["status"] != "passed" || auditID == "" || len(issues) != 0 {
+		fail("contiguous timeline: want 201 passed with audit id and no issues, got status=%d body=%v", status, body)
+	} else {
+		pass("contiguous timeline: 201 passed, audit_id=%s", auditID)
+
+		// The report must be readable by the number from the create response.
+		getStatus, fetched := auditRequest(http.MethodGet, "/api/v1/audits/"+auditID, nil)
+		if getStatus != http.StatusOK || fetched["audit_id"] != auditID || fetched["status"] != "passed" {
+			fail("lookup %s: want 200 with the created report, got status=%d body=%v", auditID, getStatus, fetched)
+		} else {
+			pass("lookup %s: 200 returns the created report", auditID)
+		}
+	}
+
+	// Gap plus overlap in one timeline: seg-a ends at frame 300, seg-b starts
+	// at frame 360 (59-frame gap), seg-c starts at frame 590 while seg-b ends
+	// at frame 600 (11-frame overlap).
+	status, body = auditRequest(http.MethodPost, "/api/v1/audits", map[string]any{
+		"rate": rate30.id,
+		"segments": []map[string]any{
+			{"id": "seg-a", "in": "00:00:01;00", "out": "00:00:10;00"},
+			{"id": "seg-b", "in": "00:00:12;00", "out": "00:00:20;00"},
+			{"id": "seg-c", "in": "00:00:19;20", "out": "00:00:30;00"},
+		},
+	})
+	issues, _ = body["issues"].([]any)
+	wantIssues := []map[string]any{
+		{"kind": "gap", "previous_segment": "seg-a", "next_segment": "seg-b", "frames": float64(59)},
+		{"kind": "overlap", "previous_segment": "seg-b", "next_segment": "seg-c", "frames": float64(11)},
+	}
+	gotIssues := make([]map[string]any, 0, len(issues))
+	for _, issue := range issues {
+		if m, ok := issue.(map[string]any); ok {
+			gotIssues = append(gotIssues, m)
+		}
+	}
+	issuesOK := len(gotIssues) == len(wantIssues)
+	for i := range wantIssues {
+		if !issuesOK {
+			break
+		}
+		for k, v := range wantIssues[i] {
+			if gotIssues[i][k] != v {
+				issuesOK = false
+			}
+		}
+	}
+	if status != http.StatusCreated || body["status"] != "failed" || !issuesOK {
+		fail("gap+overlap timeline: want 201 failed with ordered issues %v, got status=%d body=%v",
+			wantIssues, status, body)
+	} else {
+		pass("gap+overlap timeline: 201 failed with ordered issues %v", gotIssues)
+	}
+
+	// Invalid segment lists are rejected with the error envelope, carry no
+	// audit result and are not stored.
+	expectAuditError := func(name string, payload map[string]any, wantCode, wantField string) {
+		st, b := auditRequest(http.MethodPost, "/api/v1/audits", payload)
+		errObj, _ := b["error"].(map[string]any)
+		code, _ := errObj["code"].(string)
+		field, _ := errObj["field"].(string)
+		_, leakedID := b["audit_id"]
+		_, leakedIssues := b["issues"]
+		_, leakedStatus := b["status"]
+		if st != http.StatusUnprocessableEntity || code != wantCode || field != wantField ||
+			leakedID || leakedIssues || leakedStatus {
+			fail("%s: want 422 code=%s field=%s without audit result, got status=%d body=%v",
+				name, wantCode, wantField, st, b)
+			return
+		}
+		pass("%s: 422 %s on field %q, nothing stored", name, code, field)
+	}
+	expectAuditError("single segment",
+		map[string]any{"rate": rate30.id, "segments": []map[string]any{
+			{"id": "only", "in": "00:00:00;00", "out": "00:00:01;00"}}},
+		"TOO_FEW_SEGMENTS", "segments")
+	expectAuditError("duplicate segment identifier",
+		map[string]any{"rate": rate30.id, "segments": []map[string]any{
+			{"id": "dup", "in": "00:00:00;00", "out": "00:00:01;00"},
+			{"id": "dup", "in": "00:00:01;01", "out": "00:00:02;00"}}},
+		"DUPLICATE_SEGMENT_ID", "segments[1].id")
+	expectAuditError("out-point before in-point",
+		map[string]any{"rate": rate30.id, "segments": []map[string]any{
+			{"id": "a", "in": "00:00:10;00", "out": "00:00:05;00"},
+			{"id": "b", "in": "00:00:10;01", "out": "00:00:20;00"}}},
+		"END_BEFORE_START", "segments[0].out")
+	expectAuditError("dropped-frame label in segment",
+		map[string]any{"rate": rate30.id, "segments": []map[string]any{
+			{"id": "a", "in": "00:00:00;00", "out": "00:00:10;00"},
+			{"id": "b", "in": "00:01:00;01", "out": "00:02:00;00"}}},
+		"DROPPED_FRAME_LABEL", "segments[1].in")
+
+	// Unknown audit numbers return a stable not-found error, not a report.
+	st, b := auditRequest(http.MethodGet, "/api/v1/audits/aud-999999", nil)
+	errObj, _ := b["error"].(map[string]any)
+	code, _ := errObj["code"].(string)
+	field, _ := errObj["field"].(string)
+	_, leakedID := b["audit_id"]
+	if st != http.StatusNotFound || code != "AUDIT_NOT_FOUND" || field != "audit_id" || leakedID {
+		fail("unknown audit number: want 404 AUDIT_NOT_FOUND on audit_id, got status=%d body=%v", st, b)
+	} else {
+		pass("unknown audit number: 404 AUDIT_NOT_FOUND on field %q", field)
 	}
 }
 
