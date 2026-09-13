@@ -497,7 +497,7 @@ func TestTimecodeRetimeFieldErrors(t *testing.T) {
 			"target_rate": "60000/1001", "timecode": "00:10:00;00"},
 			"INVALID_RATE", "source_rate"},
 		{"missing source_rate", map[string]any{
-			"direction": "timecode_retime",
+			"direction":   "timecode_retime",
 			"target_rate": "60000/1001", "timecode": "00:10:00;00"},
 			"INVALID_RATE", "source_rate"},
 		{"invalid target_rate", map[string]any{
@@ -550,6 +550,79 @@ func TestTimecodeRetimeAmbiguousFieldsRejected(t *testing.T) {
 			assertError(t, status, body, "AMBIGUOUS_FIELD", c.wantField)
 		})
 	}
+}
+
+func TestTimecodeRetimeCaseVariantFieldsRejected(t *testing.T) {
+	// encoding/json matches struct fields case-insensitively, so a canonical
+	// key and a differently cased spelling ("source_rate" vs "Source_Rate")
+	// populate the same field. Different values under the two spellings make
+	// the request meaning ambiguous and must be rejected before conversion,
+	// regardless of which spelling happens to be decoded last.
+	base := `"source_rate":"30000/1001","target_rate":"60000/1001","timecode":"00:10:00;00"`
+	cases := []struct {
+		name      string
+		body      string
+		wantField string
+	}{
+		{
+			name:      "case-variant directions with different meanings, canonical last",
+			body:      `{"Direction":"timecode_to_frame","direction":"timecode_retime",` + base + `}`,
+			wantField: "direction",
+		},
+		{
+			name: "case-variant directions with different meanings, capital last",
+			body: `{"direction":"timecode_retime","Direction":"timecode_to_frame",` +
+				`"source_rate":"30000/1001","target_rate":"60000/1001","timecode":"00:10:00;00"}`,
+			wantField: "direction",
+		},
+		{
+			name: "case-variant source rates in conflict, canonical last",
+			body: `{"direction":"timecode_retime","Source_Rate":"60000/1001","source_rate":"30000/1001",` +
+				`"target_rate":"60000/1001","timecode":"00:10:00;00"}`,
+			wantField: "source_rate",
+		},
+		{
+			name: "case-variant source rates in conflict, capital last",
+			body: `{"direction":"timecode_retime","source_rate":"30000/1001","Source_Rate":"60000/1001",` +
+				`"target_rate":"60000/1001","timecode":"00:10:00;00"}`,
+			wantField: "source_rate",
+		},
+		{
+			name: "case-variant target rates in conflict, capital last",
+			body: `{"direction":"timecode_retime","source_rate":"30000/1001",` +
+				`"target_rate":"60000/1001","Target_Rate":"30000/1001","timecode":"00:10:00;00"}`,
+			wantField: "target_rate",
+		},
+		{
+			name: "case-variant timecodes, one illegal and one legal, capital last",
+			body: `{"direction":"timecode_retime","source_rate":"30000/1001","target_rate":"60000/1001",` +
+				`"timecode":"00:01:00;00","Timecode":"00:10:00;00"}`,
+			wantField: "timecode",
+		},
+		{
+			name: "case-variant timecodes, legal first then illegal, canonical last",
+			body: `{"direction":"timecode_retime","source_rate":"30000/1001","target_rate":"60000/1001",` +
+				`"Timecode":"00:10:00;00","timecode":"00:01:00;00"}`,
+			wantField: "timecode",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			status, body := doConvert(t, c.body)
+			// The conflict must surface as ambiguity, never as a successful
+			// migration or a downstream error such as DROPPED_FRAME_LABEL on
+			// whichever value happened to be decoded last.
+			assertError(t, status, body, "AMBIGUOUS_FIELD", c.wantField)
+		})
+	}
+}
+
+func TestTimecodeRetimeCaseVariantFieldWithSameValueAccepted(t *testing.T) {
+	body := `{"direction":"timecode_retime","source_rate":"30000/1001","Source_Rate":"30000/1001",` +
+		`"target_rate":"60000/1001","timecode":"00:10:00;00"}`
+	status, resp := doConvert(t, body)
+	require.Equal(t, http.StatusOK, status, "body: %v", resp)
+	assert.Equal(t, "00:10:00;00", resp["timecode"])
 }
 
 func TestTimecodeRetimeTrailingJSONRejected(t *testing.T) {

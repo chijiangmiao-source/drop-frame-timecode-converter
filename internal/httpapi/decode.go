@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"strings"
 )
 
 type ambiguousFieldError string
@@ -18,8 +19,11 @@ func (e ambiguousFieldError) Error() string {
 func (e ambiguousFieldError) Field() string { return string(e) }
 
 // decodeStrictJSON decodes exactly one JSON object. Unlike the standard
-// decoder, it rejects trailing JSON values and duplicate top-level fields
-// whose values are not semantically equal.
+// decoder, it rejects trailing JSON values and duplicate fields whose values
+// are not semantically equal. Duplicate detection follows encoding/json's
+// case-insensitive key matching: two spellings that bind to the same struct
+// field (for example "source_rate" and "Source_Rate") count as the same
+// field, so conflicting values under the two spellings are rejected.
 func decodeStrictJSON(r io.Reader, dst any) error {
 	raw, err := io.ReadAll(r)
 	if err != nil {
@@ -36,7 +40,13 @@ func decodeStrictJSON(r io.Reader, dst any) error {
 		return fmt.Errorf("request body must be a JSON object")
 	}
 
+	knownFoldKeys := jsonFieldFoldKeys(dst)
 	fields := make(map[string]json.RawMessage)
+	// seenByFoldKey indexes supplied keys under their case-insensitive
+	// spelling. encoding/json matches an object key to a struct field without
+	// regard to case, so "source_rate" and "Source_Rate" populate the same
+	// field; supplying both with different values leaves the meaning ambiguous.
+	seenByFoldKey := make(map[string]string)
 	for decoder.More() {
 		keyToken, err := decoder.Token()
 		if err != nil {
@@ -51,12 +61,27 @@ func decodeStrictJSON(r io.Reader, dst any) error {
 		if err = decoder.Decode(&value); err != nil {
 			return err
 		}
-		if previous, exists := fields[key]; exists {
-			if !jsonValuesEqual(previous, value) {
-				return ambiguousFieldError(key)
+		foldKey := strings.ToLower(key)
+		if other, seen := seenByFoldKey[foldKey]; seen {
+			exactRepeat := key == other
+			// An exactly repeated key is always a duplicate. Two differently
+			// cased spellings only collide when they unmarshal into the same
+			// struct field; keys unknown to dst stay distinct and are ignored.
+			if exactRepeat || knownFoldKeys[foldKey] {
+				if !jsonValuesEqual(fields[other], value) {
+					// Report the canonical field name for case variants.
+					conflictKey := key
+					if !exactRepeat {
+						conflictKey = foldKey
+					}
+					return ambiguousFieldError(conflictKey)
+				}
+				if exactRepeat {
+					continue
+				}
 			}
-			continue
 		}
+		seenByFoldKey[foldKey] = key
 		fields[key] = value
 	}
 
@@ -88,4 +113,38 @@ func jsonValuesEqual(a, b json.RawMessage) bool {
 		return false
 	}
 	return reflect.DeepEqual(av, bv)
+}
+
+// jsonFieldFoldKeys returns the set of JSON object keys that unmarshal into a
+// field of dst, keyed by their lower-cased spelling. It mirrors encoding/json's
+// key resolution: a field carrying a json tag is matched by the tag name, an
+// untagged field by its Go name, and matching is case-insensitive either way.
+// Keys outside the set are unknown to the destination struct and ignored by
+// unmarshalling, just like with the standard decoder.
+func jsonFieldFoldKeys(dst any) map[string]bool {
+	t := reflect.TypeOf(dst)
+	if t == nil {
+		return nil
+	}
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return nil
+	}
+	keys := make(map[string]bool, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+		name := field.Name
+		if tag, ok := field.Tag.Lookup("json"); ok {
+			if name = strings.Split(tag, ",")[0]; name == "-" {
+				continue
+			}
+		}
+		keys[strings.ToLower(name)] = true
+	}
+	return keys
 }

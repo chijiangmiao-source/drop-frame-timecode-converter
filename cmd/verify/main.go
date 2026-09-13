@@ -47,6 +47,7 @@ func main() {
 	checkTimecodeSpan()
 	checkTimecodeOffset()
 	checkTimecodeRetime()
+	checkCaseVariantAmbiguity()
 	checkRoundTrip()
 
 	if failures > 0 {
@@ -531,6 +532,60 @@ func checkTimecodeRetime() {
 		map[string]any{"direction": "timecode_retime", "source_rate": rate30.id,
 			"target_rate": rate60.id, "timecode": "00:01:00;01"},
 		"DROPPED_FRAME_LABEL", "timecode")
+}
+
+// checkCaseVariantAmbiguity exercises requests that supply one logical field
+// under two differently cased spellings (encoding/json binds both to the same
+// struct field). Conflicting meanings must be rejected as ambiguous, in both
+// key orders, including an illegal/legal timecode pair that must not migrate.
+func checkCaseVariantAmbiguity() {
+	fmt.Println("--- case-variant field ambiguity ---")
+	expectAmbiguousRaw := func(name, raw, wantField string) {
+		status, body := convertRaw(raw)
+		errObj, _ := body["error"].(map[string]any)
+		code, _ := errObj["code"].(string)
+		field, _ := errObj["field"].(string)
+		_, leakedTC := body["timecode"]
+		if status != http.StatusUnprocessableEntity || code != "AMBIGUOUS_FIELD" || field != wantField || leakedTC {
+			fail("%s: want 422 AMBIGUOUS_FIELD on field %q without a result, got status=%d body=%v",
+				name, wantField, status, body)
+			return
+		}
+		pass("%s: 422 AMBIGUOUS_FIELD on field %q", name, wantField)
+	}
+	expectAmbiguousRaw("direction variants in conflict, canonical last",
+		`{"Direction":"timecode_to_frame","direction":"timecode_retime",`+
+			`"source_rate":"30000/1001","target_rate":"60000/1001","timecode":"00:10:00;00"}`,
+		"direction")
+	expectAmbiguousRaw("direction variants in conflict, capital last",
+		`{"direction":"timecode_retime","Direction":"timecode_to_frame",`+
+			`"source_rate":"30000/1001","target_rate":"60000/1001","timecode":"00:10:00;00"}`,
+		"direction")
+	expectAmbiguousRaw("source_rate variants in conflict, capital last",
+		`{"direction":"timecode_retime","source_rate":"30000/1001","Source_Rate":"60000/1001",`+
+			`"target_rate":"60000/1001","timecode":"00:10:00;00"}`,
+		"source_rate")
+	expectAmbiguousRaw("target_rate variants in conflict, capital last",
+		`{"direction":"timecode_retime","source_rate":"30000/1001",`+
+			`"target_rate":"60000/1001","Target_Rate":"30000/1001","timecode":"00:10:00;00"}`,
+		"target_rate")
+	expectAmbiguousRaw("timecode variants: illegal and legal labels, capital last",
+		`{"direction":"timecode_retime","source_rate":"30000/1001","target_rate":"60000/1001",`+
+			`"timecode":"00:01:00;00","Timecode":"00:10:00;00"}`,
+		"timecode")
+	expectAmbiguousRaw("timecode variants: legal then illegal, canonical last",
+		`{"direction":"timecode_retime","source_rate":"30000/1001","target_rate":"60000/1001",`+
+			`"Timecode":"00:10:00;00","timecode":"00:01:00;00"}`,
+		"timecode")
+
+	// Same value under two spellings is a harmless repeat and still migrates.
+	status, body := convertRaw(`{"direction":"timecode_retime","source_rate":"30000/1001",` +
+		`"Source_Rate":"30000/1001","target_rate":"60000/1001","timecode":"00:10:00;00"}`)
+	if status != http.StatusOK || body["timecode"] != "00:10:00;00" {
+		fail("same-value case variant: want 200 migrated label, got status=%d body=%v", status, body)
+	} else {
+		pass("same-value case variant accepted")
+	}
 }
 
 func checkRoundTrip() {

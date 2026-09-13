@@ -189,7 +189,7 @@ curl -s -X POST http://localhost:8080/api/v1/convert \
 | `OFFSET_OUT_OF_RANGE` | `frame_offset` | 偏移后越过前一日或次日（结果只能落在相邻自然日） |
 | `END_BEFORE_START` | `end_timecode` | 终点早于起点且未提交 `next_day=true` |
 | `TIMECODE_NOT_ALIGNED` | `timecode` | 60 fps 定位点落在 30 fps 侧的半帧位置，无精确目标标签 |
-| `AMBIGUOUS_FIELD` | 冲突字段 | 同一字段重复出现且取值不同，请求含义不唯一 |
+| `AMBIGUOUS_FIELD` | 冲突字段 | 同一字段重复出现且取值不同，请求含义不唯一。大小写不同但映射到同一字段的拼写（如 `source_rate` 与 `Source_Rate`）视为同一字段 |
 | `MALFORMED_JSON` | — | 请求体不是单一、合法 JSON 对象（HTTP 400） |
 
 ## 目录结构
